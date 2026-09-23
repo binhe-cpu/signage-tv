@@ -10,7 +10,10 @@
 
 它干三件事：
 
-  1. 校验 compose / Dockerfile 的语法和关键字段（有 pyyaml 就查得细一些）
+  1. 校验 compose / Dockerfile 的语法和关键字段（有 pyyaml 就查得细一些）。
+     两个 Dockerfile（Dockerfile / Dockerfile.min）和两份 compose 都过一遍，
+     并断言两个 Dockerfile 从仓库拷的文件完全一致 —— CI 打的是 .min 那份，
+     人平时改的是另一份，最容易在这儿漂移
   2. **照着 Dockerfile 里 COPY 的那几行**，在临时目录里搭一份群晖上的目录布局，
      多一个文件都不拷
   3. 用这份布局起一次真服务，走一遍本地目录模式的主要路径
@@ -32,6 +35,7 @@ import argparse
 import http.cookiejar
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -46,7 +50,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 COMPOSE = HERE / "docker-compose.yml"
-DOCKERFILE = HERE / "Dockerfile"
+COMPOSE_MIN = HERE / "docker-compose.min.yml"
+DOCKERFILE = HERE / "Dockerfile"          # 群晖上现场构建那份（slim + boto3）
+DOCKERFILE_MIN = HERE / "Dockerfile.min"  # 最小镜像那份（alpine + boto3），CI 打它
+ADMIN_PY = HERE / "signage_admin.py"
 
 
 def say(msg=""):
@@ -101,28 +108,66 @@ def parse_copies(text: str):
         parts = line.split()[1:]
         if len(parts) < 2:
             continue
+        # COPY --from=xxx 是从**别的构建阶段**拿东西，跟「仓库里哪些文件会进镜像」
+        # 无关（Dockerfile.min 的 boto3 就是拷进来的）。不排除它，一致性断言会假红。
+        if any(p.startswith("--from=") for p in parts):
+            continue
         srcs, dst = parts[:-1], parts[-1]
         for s in srcs:
             out.append((s, dst))
     return out
 
 
-def check_files(c) -> list:
-    say("一、compose / Dockerfile 的语法与关键字段")
+def read_admin_version() -> str:
+    """服务端自称的版本号。用来钉住最小镜像的 tag —— 升级时改了代码忘了改 compose，
+    表现是容器起不来（找不到镜像），这种错在 NAS 上很难看出来。"""
+    try:
+        text = ADMIN_PY.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    m = re.search(r'^ADMIN_VERSION\s*=\s*"([^"]+)"', text, re.M)
+    return m.group(1) if m else ""
 
-    df = DOCKERFILE.read_text(encoding="utf-8")
-    c.ok("Dockerfile 存在且基于 python:3.12-slim", "FROM python:3.12-slim" in df)
-    c.ok("Dockerfile 会装 boto3（对象存储模式要靠它）", "boto3" in df)
-    c.ok("Dockerfile 设了 PYTHONDONTWRITEBYTECODE（代码是只读挂载）",
+
+def check_one_dockerfile(c, path: Path, base: str, label: str) -> list:
+    """一个 Dockerfile 的通用断言，返回它从仓库拷了哪些文件"""
+    if not path.exists():
+        c.ok(f"{label} 存在", False, str(path))
+        return []
+    df = path.read_text(encoding="utf-8")
+    c.ok(f"{label} 基于 {base}", f"FROM {base}" in df)
+    c.ok(f"{label} 会装 boto3（对象存储模式要靠它）", "boto3" in df)
+    c.ok(f"{label} 设了 PYTHONDONTWRITEBYTECODE",
          "PYTHONDONTWRITEBYTECODE" in df)
-    c.ok("Dockerfile 声明了 /data 和 /site 两个卷",
+    c.ok(f"{label} 声明了 /data 和 /site 两个卷",
          'VOLUME ["/data", "/site"]' in df)
-    c.ok("Dockerfile 暴露 8600", "EXPOSE 8600" in df)
+    c.ok(f"{label} 暴露 8600", "EXPOSE 8600" in df)
+    c.ok(f"{label} 的启动命令指向 /app/server/signage_admin.py",
+         "/app/server/signage_admin.py" in df)
 
     copies = parse_copies(df)
-    c.ok("Dockerfile 里能解析出 COPY 指令", bool(copies), str(copies))
+    c.ok(f"{label} 里能解析出 COPY 指令", bool(copies), str(copies))
     for src, _ in copies:
-        c.ok(f"COPY 的源存在：{src}", (ROOT / src.rstrip("/")).exists())
+        c.ok(f"{label} COPY 的源存在：{src}", (ROOT / src.rstrip("/")).exists())
+    return copies
+
+
+def check_files(c) -> list:
+    say("一、镜像与部署配置的语法、关键字段")
+
+    copies = check_one_dockerfile(c, DOCKERFILE, "python:3.12-slim", "Dockerfile")
+    copies_min = check_one_dockerfile(c, DOCKERFILE_MIN, "python:3.12-alpine",
+                                     "Dockerfile.min")
+    # 重点：两份从仓库拷的文件必须完全一致（连落点）。漏 web/ = 页面 404，
+    # 漏 tools/ = 启动就 import 报错 —— 而 CI 打的是 .min 那份。
+    c.ok("两个 Dockerfile 从仓库拷的文件完全一致（含落点）",
+         bool(copies) and sorted(copies) == sorted(copies_min),
+         f"Dockerfile={copies}  Dockerfile.min={copies_min}")
+
+    # docker build 的上下文是「.」（就是仓库根），-f 只指定 Dockerfile 在哪。
+    # 所以 .dockerignore 放 server/ 里不生效 —— 这个位置很容易搞错。
+    c.ok("仓库根目录有 .dockerignore（放 server/ 里不生效，上下文根是仓库根）",
+         (ROOT / ".dockerignore").exists())
 
     text = COMPOSE.read_text(encoding="utf-8")
     try:
@@ -179,7 +224,68 @@ def check_files(c) -> list:
     cmd = s.get("command") or []
     c.ok("启动命令指向 /app/server/signage_admin.py",
          any("/app/server/signage_admin.py" in str(x) for x in cmd), str(cmd))
+
+    check_compose_min(c)
     return copies
+
+
+def check_compose_min(c) -> None:
+    """最小镜像那份部署文件。它跟原版有个本质区别：**不挂代码**，代码在镜像里。
+
+    挂了 ./app:/app 会用宿主目录盖住镜像里的代码（目录不存在还会起不来），
+    所以「没有挂 /app」这条是它最容易写错的地方。
+    """
+    if not COMPOSE_MIN.exists():
+        c.ok("最小镜像版的 docker-compose.min.yml 存在", False, str(COMPOSE_MIN))
+        return
+    text = COMPOSE_MIN.read_text(encoding="utf-8")
+    ver = read_admin_version()
+    c.ok("最小版 compose 里写的是最小镜像名，且版本号跟服务端一致",
+         bool(ver) and f"signage-admin:min-{ver}" in text,
+         f"服务端版本 {ver!r}")
+
+    try:
+        import yaml
+    except ImportError:
+        # 没 pyyaml 就只做文本层面的检查，别在这假装通过
+        c.ok("最小版 compose 没有挂 ./app（代码在镜像里，挂了会盖住它）",
+             "./app:/app" not in text)
+        c.ok("最小版 compose 挂了 data / site / 时区",
+             all(x in text for x in ("./data:/data", "./site:/site",
+                                     "/etc/localtime:/etc/localtime:ro")))
+        return
+
+    data = yaml.safe_load(text) or {}
+    s = (data.get("services") or {}).get("signage-admin") or {}
+    c.ok("最小版有一个叫 signage-admin 的 service", bool(s),
+         f"实际有 {list(data.get('services') or {})}")
+    c.ok("最小版没有过时的 version 字段", "version" not in data)
+    img = str(s.get("image") or "")
+    c.ok("最小版 image 指向最小镜像（signage-admin:min-<版本>）",
+         bool(ver) and img == f"signage-admin:min-{ver}", img or "(空)")
+
+    vols = [str(v) for v in (s.get("volumes") or [])]
+    c.ok("最小版**没有**挂 ./app（代码在镜像里，挂了会盖住它，目录不存在还起不来）",
+         not any("/app" in v for v in vols), str(vols))
+    for want, why in (("./data:/data", "数据目录"),
+                      ("./site:/site", "素材目录"),
+                      ("/etc/localtime:/etc/localtime:ro", "时区")):
+        c.ok(f"最小版挂了{why}", want in vols, str(vols))
+
+    env = s.get("environment") or {}
+    if isinstance(env, list):
+        env = dict(x.split("=", 1) for x in env if "=" in x)
+    c.ok("最小版 SIGNAGE_DATA_DIR 指向 /data",
+         env.get("SIGNAGE_DATA_DIR") == "/data", repr(env.get("SIGNAGE_DATA_DIR")))
+    adv = str(env.get("SIGNAGE_ADVERTISE_BASE") or "").strip()
+    c.ok("最小版设了 SIGNAGE_ADVERTISE_BASE（容器里不设，日志会打内网地址）",
+         adv.startswith("http://"), adv)
+    c.ok("最小版没有误设 SIGNAGE_REPORT_TOKEN（端侧没地方填它）",
+         not str(env.get("SIGNAGE_REPORT_TOKEN") or "").strip())
+    c.ok("最小版端口映射到了 8600",
+         any(str(p).endswith(":8600") for p in (s.get("ports") or [])),
+         str(s.get("ports")))
+    c.ok("最小版有健康检查", bool(s.get("healthcheck")))
 
 
 # ---------------------------------------------------------------- 二、搭布局

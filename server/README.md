@@ -120,13 +120,15 @@ site/                        默认的发布目录（配置里没指定 storage 
 家里或店里本来就有群晖的话，这是最省心的跑法 —— NAS 常年不关机，比一台 Windows 电脑靠谱，
 而且它本来就是存素材的地方。
 
-先说清楚两件事：
+先说清楚三件事：
 
 - 上面那个 `signage-admin.exe` 在群晖上**一点用都没有**。群晖是 Linux，跑不了 Windows 程序。
   但**源码能直接用，一行都不用改** —— 服务端从第一天起就只用 Python 标准库（外带一个 boto3），
   这就是当初不肯上框架的回报。
-- 本地目录模式（素材就存在 NAS 上）**连 boto3 都不用**。所以这条路是零构建的：
+- 本地目录模式（素材就存在 NAS 上）**连 boto3 都不用**。所以下面这套是零构建的：
   拉一个官方 python 镜像，把代码挂进去就跑，不需要构建任何镜像。
+- 还有一条**更省事**的路 —— 用打好的最小镜像，NAS 上只放一个 compose 文件，
+  代码和依赖全在镜像里。两条路怎么选，见下面「用最小镜像跑」。
 
 ### 需要什么
 
@@ -230,6 +232,55 @@ http://<NAS的IP>:8600/playlist.json
    跑 `docker pull python:3.12-slim`，再 `docker save python:3.12-slim -o python312.tar`，
    把 tar 传到 NAS，然后 Container Manager → 映像 → 新增 → 从文件添加。
 
+   走最小镜像那条路（下一节）的话，这一步也省了 —— 镜像本来就是一个 tar.gz。
+
+### 用最小镜像跑（不想在 NAS 上放代码就走这条）
+
+上面那套要往 NAS 拷 `server/` 和 `tools/` 两个目录，NAS 还得能拉官方镜像。
+另一条路更省事：**用已经打好的最小镜像**，NAS 上只有一个 compose 文件，
+代码和 boto3 全在镜像里，连网都不用通。
+
+镜像从哪来，二选一：
+
+- **推荐**：GitHub 仓库的 `Releases` 页下载 `signage-admin-docker-<版本>.tar.gz`
+  （就是 `docker save` 出来的），传到 NAS → Container Manager → **映像 → 新增 → 从文件添加**
+- 自己在有 Docker 的机器上构建（**在工程根目录**执行，上下文必须是根目录）：
+  ```bash
+  docker build -f server/Dockerfile.min -t signage-admin:min-1.2.0 .
+  docker save signage-admin:min-1.2.0 | gzip > signage-admin-docker-1.2.0.tar.gz
+  ```
+
+然后在 NAS 上建一个文件夹，放**一个文件**加两个空目录：
+
+```
+signage/
+  docker-compose.min.yml    ← 工程 server/ 目录里那个（Release 里也带一份）
+  data/                     ← 空目录就行，访问码和台账会写这里
+  site/                     ← 空目录就行，发布的清单和素材放这里
+```
+
+改 `docker-compose.min.yml` 里标了 ★ 的两行（NAS 的局域网 IP、镜像名里的版本号），
+Container Manager → 项目 → 新增 → 路径选这个文件夹 → 来源上传那个 yml → 启动。
+
+> **跟上面那个 compose 有个关键区别：这里不挂 `./app:/app`。** 代码已经在镜像里了，
+> 再挂一个宿主目录上去会把镜像里的代码盖住，目录不存在还会直接起不来。
+> `data/` 和 `site/` 照旧，一个都不能少。
+
+两种跑法怎么选：
+
+| | 挂代码（零构建） | 最小镜像 |
+|---|---|---|
+| 镜像 | 官方 `python:3.12-slim`，NAS 自己拉 | `signage-admin:min-<版本>`，导进去 |
+| NAS 上要不要放代码 | 要拷 `server/` 和 `tools/` | 不用，一个 yml 就够 |
+| NAS 要不要能联网 | 要（拉镜像） | 不要 |
+| 改代码怎么生效 | 改完重启容器就行 | 得重新构建、重新导镜像 |
+| 镜像体积 | 约 155MB（装完 boto3） | 约 70MB（Alpine） |
+| 支持 COS 对象存储 | 要现场 build 一次 | 直接填环境变量 |
+
+> 镜像小在哪：基础镜像从 Debian 换成 Alpine（musl + busybox，整个系统 50MB 出头），
+> boto3 那几个包全是纯 Python，不需要编译，所以不用往镜像里塞 gcc 那一套。
+> 体积数字每次 CI 都会打在构建日志里，也汇总在 Actions 页面那次运行的 Summary 上。
+
 ### 数据在哪，怎么备份
 
 `docker/signage/` 这一个文件夹装完全部东西：
@@ -241,9 +292,13 @@ http://<NAS的IP>:8600/playlist.json
 
 ### 想用对象存储（COS）
 
-上面这套不装 boto3，所以只支持本地目录模式。素材存 NAS 上其实挺好（局域网内网速比公网快，
-也不用花对象存储的钱）。真要用 COS，就把 compose 里的 `image:` 换成 `build:` 那段，
-让 NAS 现场构建一个装了 boto3 的镜像 —— `docker-compose.yml` 末尾有现成的配置，照抄就行。
+「挂代码」那套（`docker-compose.yml`）不装 boto3，所以只支持本地目录模式。素材存 NAS 上
+其实挺好（局域网内网速比公网快，也不用花对象存储的钱）。真要用 COS，两条路：
+
+- **最小镜像**（`docker-compose.min.yml`）：镜像里已经带了 boto3，把 `SIGNAGE_STORAGE`
+  和那几个 `SIGNAGE_S3_*` / `AWS_*` 环境变量填上就完事，不用改镜像 —— 文件末尾有现成的注释
+- **挂代码那套**：把 compose 里的 `image:` 换成 `build:` 那段，让 NAS 现场构建一个装了
+  boto3 的镜像 —— `docker-compose.yml` 末尾有现成的配置，照抄就行
 
 ### 部署前先自检
 

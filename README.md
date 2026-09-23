@@ -55,7 +55,8 @@ sh build.sh
 
 ### 不想用本机环境？让 GitHub 编
 
-代码推上去之后，GitHub 会自动编出 **APK** 和**网页后台 exe** 两样，
+代码推上去之后，GitHub 会自动编出三样：**APK**、**网页后台 exe**、
+**最小容器镜像**（Alpine，约 70MB，附带群晖能直接导入的 tar.gz），
 不需要本机装 JDK 和 Android SDK。打一个 `v` 开头的 tag 推上去，
 还会自动生成 Release，产物谁都能直接下载：
 
@@ -499,8 +500,12 @@ Windows 也可以双击 `server\start-server.bat`。然后打开 <http://127.0.0
 **有群晖 NAS 的话，还有一条更省心的路**：把这个后台跑在 NAS 上（Container Manager
 里起个容器就行）。**不用构建镜像、也不用装 Python** —— 服务端只用标准库，
 拉个官方 python 镜像挂上代码就能跑。NAS 常年不关机，素材本来也存它上面，
-比"另租服务器"或"店里电脑一直开着"都稳。步骤见
-[`server/README.md`](server/README.md) 第三节。
+比"另租服务器"或"店里电脑一直开着"都稳。
+
+想连代码都不往 NAS 上放，就用 CI 打好的**最小镜像**（约 70MB，Alpine）：
+Releases 里下载 `signage-admin-docker-<版本>.tar.gz` 导进 NAS，配一个
+`docker-compose.min.yml` 就完事 —— 走这条 NAS 连网都不用通。
+两种跑法的取舍见 [`server/README.md`](server/README.md) 第三节。
 
 > 注意 `signage-admin.exe` 在群晖上没用（那是 Windows 程序），但**源码一行都不用改**。
 

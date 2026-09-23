@@ -1,0 +1,30 @@
+# docker build 的上下文是**整个仓库根目录** —— `-f server/Dockerfile` 只指定
+# Dockerfile 在哪，上下文还是最后那个「.」。所以这个文件必须放在**仓库根目录**，
+# 放 server/ 里是一点用都没有的。
+#
+# 排除的东西不会被传进构建上下文：本机构建时能少传 70MB（app/build 40MB、
+# server/dist 里那个 27MB 的 exe），也避免把运行状态、本地配置带进去。
+
+# 版本库自己的东西
+.git
+.github
+.gitattributes
+
+# 编译产物和构建缓存
+.gradle/
+build/
+app/build/
+local.properties
+
+# 本机专属（python 装在哪各人不同）
+local-env.bat
+local-env.example.bat
+
+# 服务端跑起来才有的东西：打包产物、访问码、设备台账、发布的素材
+server/dist/
+server/data/
+server/site/
+
+# Python 缓存
+__pycache__/
+*.pyc

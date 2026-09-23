@@ -1,0 +1,103 @@
+# 门店屏网页后台 · 群晖 Container Manager 用（最小镜像版）
+#
+# 跟 docker-compose.yml 的区别，就两点：
+#   · 代码在**镜像里**，不需要把 server/ 和 tools/ 拷到 NAS，也**不挂 ./app**
+#     （挂了反而会用宿主目录把镜像里的代码盖住，目录不存在还会起不来）
+#   · 这个镜像装了 boto3，要用 COS 对象存储直接填环境变量就行，不用改镜像
+#
+# 适合的场合：NAS 上不想放代码、不想能 build、甚至不想联网拉镜像。
+#
+# ── 怎么用 ──────────────────────────────────────────────
+# 1. 先把镜像弄进 NAS，三选一：
+#    a) **推荐**：GitHub 的 Release 里下载 signage-admin-docker-1.2.0.tar.gz，
+#       传到 NAS → Container Manager → 映像 → 新增 → 从文件添加
+#    b) 自己有 Docker 的机器上构建再导出：
+#          cd <工程根目录>
+#          docker build -f server/Dockerfile.min -t signage-admin:min-1.2.0 .
+#          docker save signage-admin:min-1.2.0 | gzip > signage-admin-docker-1.2.0.tar.gz
+#    c) 用原版那条路（docker-compose.yml + 挂代码），不需要这个文件
+# 2. 在 NAS 上建项目文件夹（docker 共享文件夹下，比如 signage/），
+#    只放**这一个文件**，再建两个空目录：
+#        signage/
+#          docker-compose.min.yml   ← 这个文件
+#          data/                    ← 空目录就行，访问码和台账会写这里
+#          site/                    ← 空目录就行，发布的清单和素材放这里
+# 3. 改下面标了 ★ 的两行（NAS 的局域网 IP、镜像名里的版本号）
+# 4. Container Manager → 项目 → 新增 → 路径选这个文件夹 →
+#    来源选「上传 docker-compose.min.yml」→ 启动
+#
+# 页面地址：http://<NAS的IP>:8600/
+# 第一次启动的访问码在容器日志里（Container Manager 里点容器 → 日志）
+#
+# 升级：导入新版本的 tar.gz（名字里带新版本号），把下面 image: 的版本号改掉，
+#       项目「操作 → 重新构建」。data/ 和 site/ 不用动。
+
+services:
+  signage-admin:
+    # ★ 导入 tar.gz 之后，去「映像」页面看一眼准确的名字再填这里 —— 对不上起不来。
+    #   名字里的 1.2.0 跟镜像本身是一致的，升级时两处一起改。
+    image: signage-admin:min-1.2.0
+    container_name: signage-admin
+
+    # NAS 重启、容器崩了都自己拉起来。除非在界面上手动停，否则一直跑
+    restart: unless-stopped
+
+    volumes:
+      # 注意：这里**没有** ./app:/app —— 代码已经在镜像里了
+      #
+      # 访问码、设备台账。**别丢这个目录**，丢了访问码要重设、十块屏的记录清空
+      - ./data:/data
+      # 发布的清单和素材。电视端就是从这里拉的
+      - ./site:/site
+      # 跟 NAS 走同一时区，不然日志里那行时间差 8 小时
+      - /etc/localtime:/etc/localtime:ro
+
+    environment:
+      # ★ 改这里：填这台 NAS 在局域网里的地址（电视和电脑在的那个网段）。
+      #
+      # 为什么不自动取：容器里探到的「本机 IP」是容器自己的小网络地址（172.x），
+      # 跟你的局域网是隔开的，电视连不上。所以必须把真实地址告诉它。
+      # 这个值只影响日志和启动提示里显示的地址 —— 页面上那张「电视端填什么」
+      # 卡片是按浏览器地址栏算的，不受这里影响。
+      SIGNAGE_ADVERTISE_BASE: "http://192.33.15.4:8600"
+
+      SIGNAGE_DATA_DIR: /data
+      SIGNAGE_STORAGE: "local:/site"
+
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+      # 访问码。不设的话：第一次启动随机生成一个打进日志，之后存在 data/code.json
+      # 里、重启不变，也能在页面上改。想固定死（页面上就改不了）就把下面放开。
+      # 忘了码：删掉 data/code.json 重启，会生成一个新的并打进日志
+      # SIGNAGE_ADMIN_CODE: "换成你自己的访问码"
+
+      # 状态上报口令。**默认不要设** —— 端侧没地方填它，设了十块屏会静默报不上来。
+      # 只有把这个端口暴露到公网时才需要
+      # SIGNAGE_REPORT_TOKEN: ""
+
+      # ── 要用对象存储（COS/OSS）就把 SIGNAGE_STORAGE 换成下面这条 ──
+      # 这个镜像是带 boto3 的，不用改镜像
+      #
+      # SIGNAGE_STORAGE: "s3://你的桶名-1250000000/signage"
+      # SIGNAGE_S3_ENDPOINT: "https://cos.ap-shanghai.myqcloud.com"
+      # SIGNAGE_S3_REGION: "ap-shanghai"
+      # AWS_ACCESS_KEY_ID: "COS 的 SecretId"
+      # AWS_SECRET_ACCESS_KEY: "COS 的 SecretKey"
+      #
+      # 对象存储模式下电视端直连桶，site/ 那个挂载就用不上了（留着也无害），
+      # 但 data/ 千万别丢 —— 访问码和台账在那儿。
+
+    ports:
+      # 左边是 NAS 上的端口，想换就改左边（右边别动）。改完页面地址跟着变
+      - "8600:8600"
+
+    healthcheck:
+      test:
+        ["CMD", "python3", "-c",
+         "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8600/api/health',timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

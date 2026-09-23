@@ -1,0 +1,77 @@
+# 门店屏网页后台 · 最小容器镜像
+#
+# 跟 Dockerfile 的唯一区别是基础镜像和体积，功能一模一样：
+#   同样带 boto3（对象存储模式能用）、同样的 COPY 清单、同样的环境变量和启动命令。
+#
+#     server/Dockerfile       python:3.12-slim     约 155MB（含 boto3）
+#     server/Dockerfile.min   python:3.12-alpine   约  70MB（含 boto3）← 这个
+#
+# 为什么能小这么多：slim 是 Debian，光 Python 就 130MB 上下；Alpine 用 musl libc
+# 加 busybox，整个系统 50MB 出头。boto3 那几个包（botocore / s3transfer / urllib3 /
+# jmespath / dateutil）全是纯 Python，没有要编译的东西，所以 Alpine 上装得动，
+# 不需要引进 gcc / musl-dev 那一堆。
+#
+# 构建（在**工程根目录**执行 —— 上下文必须是根目录，因为要 server/ 和 tools/）：
+#     docker build -f server/Dockerfile.min -t signage-admin:min-1.2.0 .
+#
+# 国内 pip 慢的话指定个源：
+#     docker build -f server/Dockerfile.min \
+#         --build-arg PIP_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple \
+#         -t signage-admin:min-1.2.0 .
+#
+# 不想自己构建也行：GitHub 的 Release 里有 CI 打好的
+# signage-admin-docker-<版本>.tar.gz（就是 docker save 出来的），
+# 传到群晖「映像 → 新增 → 从文件添加」直接用，NAS 上不需要能联网拉镜像。
+# 配套的部署文件是 docker-compose.min.yml（注意跟原版有个重要区别：不挂 ./app）。
+
+# ── 第一段：只用来装 boto3 ─────────────────────────────────
+# 这一段的所有东西（pip 缓存、构建期的临时目录）都不会进最终镜像，
+# 最终镜像只从它这里拿走装好的那几个包。
+FROM python:3.12-alpine AS deps
+
+ARG PIP_INDEX=https://pypi.org/simple
+RUN pip install --no-cache-dir --prefix=/install -i ${PIP_INDEX} boto3
+
+# ── 第二段：真正的镜像 ─────────────────────────────────────
+FROM python:3.12-alpine
+
+# 时区数据。在线判定用的是 epoch 差值（服务器收到的时刻），不受时区影响，
+# 纯粹是为了日志里那行时间戳顺眼。没这个文件 TZ 环境变量就是空的。
+RUN apk add --no-cache tzdata
+
+# 顺手删掉跑服务用不上的标准库目录，省几 MB。
+# rm -rf 对不存在的路径不报错，所以这份清单在别的 Python 小版本上少几项也不会失败。
+RUN rm -rf \
+      /usr/lib/python3.12/test \
+      /usr/lib/python3.12/idlelib \
+      /usr/lib/python3.12/lib2to3 \
+      /usr/lib/python3.12/tkinter \
+      /usr/lib/python3.12/ensurepip
+
+# 从 deps 段取装好的 boto3。pip --prefix=/install 铺出来的目录结构跟 /usr/local 对得上
+# （bin/ 里的脚本、lib/python3.12/site-packages/ 里的包），所以整段拷过去就行。
+COPY --from=deps /install/ /usr/local/
+
+# PYTHONDONTWRITEBYTECODE：别去写 __pycache__
+# PYTHONUNBUFFERED：日志即时输出，不然 docker logs 是空的
+ENV TZ=Asia/Shanghai \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    SIGNAGE_DATA_DIR=/data \
+    SIGNAGE_STORAGE=local:/site
+
+WORKDIR /app
+
+# 只拷运行必需的四个东西。故意不用 COPY server/ 整个目录 ——
+# 那会把 dist/ 里 27MB 的 exe、打包脚本、自测脚本一起塞进镜像。
+# 这四行必须跟 server/Dockerfile 保持一致：少拷一个的表现是
+# 启动正常、日志全对、只有网页 404（漏 web/）或启动就报 import 错（漏 tools/）。
+COPY server/signage_admin.py /app/server/
+COPY server/backend.py /app/server/
+COPY server/web/ /app/server/web/
+COPY tools/signage_core.py /app/tools/
+
+VOLUME ["/data", "/site"]
+EXPOSE 8600
+
+CMD ["python3", "/app/server/signage_admin.py", "--host", "0.0.0.0", "--port", "8600"]

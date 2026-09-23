@@ -1,8 +1,10 @@
 # ============================================================
-#  推上来就自动编译两样东西
+#  推上来就自动编译三样东西
 #
-#    · 安卓 APK   —— ubuntu + JDK 17 + Android SDK 34
+#    · 安卓 APK     —— ubuntu + JDK 17 + Android SDK 34
 #    · 网页后台 exe —— windows + PyInstaller 单文件
+#    · 最小容器镜像 —— ubuntu + docker build（Alpine 多阶段，约 70MB），
+#                     附带导出成 tar.gz，群晖「映像 → 从文件添加」直接用
 #
 #  另外顺手跑服务端自测。这一条有个额外价值：runner 是 Linux，
 #  跟群晖 NAS 是同一个环境，所以「能不能在 Linux 上跑」不用等到
@@ -11,7 +13,7 @@
 #  ── 怎么用 ──────────────────────────────────────────────
 #  平时：改完 push 到 main，自动编译。结果在仓库的 Actions 页看，
 #        产物在该次运行页面下方的 Artifacts 里下载（要登录）。
-#  发版：打一个 v 开头的 tag 推上来，会自动建 Release 并把两个产物
+#  发版：打一个 v 开头的 tag 推上来，会自动建 Release 并把产物
 #        挂出去（Release 附件谁都能直接下载，不用登录）：
 #            git tag v0.3.9 && git push origin v0.3.9
 #  手动：Actions 页面选这个工作流 -> Run workflow。
@@ -229,12 +231,165 @@ jobs:
         run: python check-deploy.py
 
   # ----------------------------------------------------------
-  #  4) 打 tag 时发 Release（产物挂成附件，谁都能直接下）
+  #  4) 最小容器镜像
+  #     这是**唯一真 build 镜像、真起容器**的地方。check-deploy.py 是按 COPY
+  #     清单在临时目录里模拟布局，证明不了这三件事：Alpine 上 boto3 装得动、
+  #     多阶段拷贝没拷错位置、容器里页面真能打开。这三样都得真跑一次才算数。
+  # ----------------------------------------------------------
+  docker:
+    name: 容器镜像（最小）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v7
+
+      - name: 读出服务端版本号
+        id: ver
+        run: |
+          V=$(grep -oP '^ADMIN_VERSION\s*=\s*"\K[^"]+' server/signage_admin.py)
+          if [ -z "$V" ]; then
+            echo "::error title=读不出版本号::server/signage_admin.py 里的 ADMIN_VERSION 那行是不是被改坏了"
+            exit 1
+          fi
+          echo "name=$V" >> "$GITHUB_OUTPUT"
+          echo "本次版本：$V"
+
+      - name: 构建最小镜像
+        env:
+          V: ${{ steps.ver.outputs.name }}
+        run: |
+          set -o pipefail
+          if ! docker build -f server/Dockerfile.min -t "signage-admin:min-$V" . 2>&1 | tee docker-build.log; then
+            echo "———— 构建失败，关键几行 ————"
+            KEY=$(grep -nE "^ERROR|error:|Error|failed|not found" docker-build.log | head -8 || true)
+            echo "$KEY"
+            printf '%s\n' "$KEY" | grep -v '^$' | sed 's/%/%25/g; s/\r$//' \
+              | while IFS= read -r l; do echo "::error title=docker build::${l}"; done
+            echo "———— 最后 30 行 ————"
+            tail -30 docker-build.log
+            exit 1
+          fi
+
+      # 构建成功只说明镜像能出来。web/ 没进镜像、boto3 拷错位置这些毛病，
+      # 表现都是「镜像正常、服务照跑、只是页面 404 / COS 用不了」，
+      # 所以下面必须真起容器、真发请求、真 exec 进去看一眼。
+      - name: 真起容器跑一遍
+        env:
+          V: ${{ steps.ver.outputs.name }}
+        run: |
+          set -euo pipefail
+          IMG="signage-admin:min-$V"
+          NAME=smoke
+          PORT=18600
+
+          docker run -d --name "$NAME" -p "$PORT:8600" "$IMG" > /dev/null
+
+          up=""
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:$PORT/api/health" > /dev/null 2>&1; then up=1; break; fi
+            # 容器自己退了就别再等
+            if [ "$(docker inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" != "true" ]; then break; fi
+            sleep 1
+          done
+          if [ -z "$up" ]; then
+            echo "::error title=容器起不来::docker run 之后 30 秒内 /api/health 没通"
+            echo "———— 容器日志 ————"
+            docker logs "$NAME" 2>&1 | tail -40
+            exit 1
+          fi
+          echo "容器起来了，逐条验："
+
+          bad=0
+          chk() {                     # chk <说明> <命令…>
+            local desc="$1"; shift
+            local out=""
+            if out=$("$@" 2>&1); then
+              echo "  ok   $desc"
+            else
+              echo "  FAIL $desc"
+              printf '%s\n' "$out" | tail -6
+              echo "::error title=容器冒烟失败::$desc"
+              bad=1
+            fi
+          }
+
+          chk "探活接口通" curl -fsS "http://127.0.0.1:$PORT/api/health"
+          chk "页面能打开（web/ 进镜像了）" \
+            sh -c "curl -fsS http://127.0.0.1:$PORT/ | grep -qi '<html'"
+          chk "静态资源能取到（web/app.js）" \
+            curl -fsS -o /dev/null "http://127.0.0.1:$PORT/app.js"
+          chk "镜像里能 import boto3（多阶段拷贝对了）" \
+            docker exec "$NAME" python3 -c "import boto3; print(boto3.__version__)"
+          chk "镜像里能找到 tools/signage_core.py" \
+            docker exec "$NAME" python3 -c "import sys; sys.path.insert(0, '/app/tools'); import signage_core"
+          chk "时区是 CST（tzdata 装上了）" \
+            sh -c "test \"$(docker exec $NAME date +%Z)\" = CST"
+          chk "自报版本跟代码里一致" \
+            sh -c "docker exec $NAME python3 /app/server/signage_admin.py --version | grep -qF '$V'"
+
+          echo "———— 容器日志 ————"
+          docker logs "$NAME" 2>&1 | tail -15
+          docker rm -f "$NAME" > /dev/null
+
+          if [ "$bad" != "0" ]; then
+            echo "::error title=容器冒烟有失败项::上面标 FAIL 的那几条就是"
+            exit 1
+          fi
+          echo "容器冒烟全过"
+
+      - name: 体积（跟原版那份比）
+        env:
+          V: ${{ steps.ver.outputs.name }}
+        run: |
+          set -euo pipefail
+          # 原版那份以前只被 check-deploy.py「模拟」验过，这里第一次真 build。
+          # 它 build 不过说明群晖现场构建那条路是坏的，所以也算失败，不忽略。
+          docker build -f server/Dockerfile -t signage-admin:slim . > /dev/null
+
+          mb() { docker image inspect "$1" --format '{{.Size}}' | awk '{printf "%.1f MB", $1/1048576}'; }
+          MIN_MB=$(mb "signage-admin:min-$V")
+          SLIM_MB=$(mb signage-admin:slim)
+          echo "最小镜像 $MIN_MB ／ 原版 $SLIM_MB"
+
+          {
+            echo "### 容器镜像体积"
+            echo
+            echo "| 镜像 | 基础镜像 | 未压缩 |"
+            echo "|---|---|---|"
+            echo "| \`signage-admin:min-$V\` | python:3.12-alpine | $MIN_MB |"
+            echo "| \`signage-admin:slim\` | python:3.12-slim | $SLIM_MB |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 导出镜像（群晖「映像 → 新增 → 从文件添加」直接用）
+        env:
+          V: ${{ steps.ver.outputs.name }}
+        run: |
+          set -euo pipefail
+          docker save "signage-admin:min-$V" | gzip -9 > "signage-admin-docker-$V.tar.gz"
+          ls -lh "signage-admin-docker-$V.tar.gz"
+          TAR=$(du -h "signage-admin-docker-$V.tar.gz" | cut -f1)
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**导出成 tar.gz：$TAR**（随 Artifact / Release 附件一起给）" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传镜像和部署文件
+        uses: actions/upload-artifact@v7
+        with:
+          name: signage-admin-docker-${{ steps.ver.outputs.name }}
+          path: |
+            signage-admin-docker-*.tar.gz
+            server/docker-compose.min.yml
+          if-no-files-found: error
+          retention-days: 30
+
+  # ----------------------------------------------------------
+  #  5) 打 tag 时发 Release（产物挂成附件，谁都能直接下）
   # ----------------------------------------------------------
   release:
     name: 发 Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [apk, exe]
+    needs: [apk, exe, docker]
     runs-on: ubuntu-latest
 
     permissions:
@@ -263,5 +418,10 @@ jobs:
           - signage-*.apk —— 安卓电视端，拷进电视安装（minSdk 21，老电视也能装）
           - signage-admin.exe —— 网页后台（Windows），双击运行，第一次要放行防火墙
           - signage-server.example.json —— 后台启动配置模板，改名成 signage-server.json 放在 exe 旁边就生效
+          - signage-admin-docker-*.tar.gz —— 最小容器镜像（Alpine，约 70MB）。传到群晖
+            「Container Manager → 映像 → 新增 → 从文件添加」，再配 docker-compose.min.yml
+          - docker-compose.min.yml —— 上面那个镜像的群晖部署文件。**注意它不挂代码目录**，
+            代码在镜像里，只需要建 data/ 和 site/ 两个空目录
 
-          编译环境：JDK 17 + Android SDK 34 + Gradle 8.7；Python 3.12 + PyInstaller。'
+          编译环境：JDK 17 + Android SDK 34 + Gradle 8.7；Python 3.12 + PyInstaller；
+          Docker（Alpine 3.12 多阶段构建）。'
