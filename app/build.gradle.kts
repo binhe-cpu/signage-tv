@@ -7,8 +7,8 @@ plugins {
  * 版本号只在这里改一处，下面 defaultConfig 和 APK 文件名都从它取。
  * 每次发新版本：versionCode 加 1（整数，只能涨不能降），versionName 改成你想要的名字。
  */
-val appVersionCode = 11
-val appVersionName = "0.3.8"
+val appVersionCode = 12
+val appVersionName = "0.3.9"
 
 android {
     namespace = "com.laodao.signage"

@@ -118,6 +118,63 @@ object UploadAuth {
         return o.toString(2)
     }
 
+    // ==================== 电视端「点屏呼二维码」的认证 ====================
+
+    /**
+     * 认证通过后的免认证窗口。店员传一次素材往往要点好几次屏幕，每次都重输太烦；
+     * 留太长又等于没这道门，所以取 5 分钟。
+     */
+    const val GRACE_MS = 5 * 60 * 1000L
+
+    /** 连错这么多次之后开始冷却 */
+    const val TRY_LIMIT = 5
+
+    /** 冷却时长。电视就摆在店里、码又短，不拦一下谁都能站在那儿一直试 */
+    const val COOLDOWN_MS = 60_000L
+
+    /**
+     * 电视上呼出二维码前要不要先认证。
+     *
+     * 二维码是贴在店里屏幕上的，谁走过都能扫 —— 扫到就能删素材、改服务器地址。
+     * 所以「看一眼二维码」这件事本身得先证明是店里的人。认证用的就是手机页那同一个
+     * 访问码，不再另造一套密码。
+     *
+     * **没设访问码 = 不拦人**：跟手机端登录同一套语义，也留了「删文件自救」那条路。
+     */
+    fun gateNeeded(code: String): Boolean = code.isNotEmpty()
+
+    /** 电视上输进来的码对不对。两边都 trim，别让一个空格毁掉一次尝试 */
+    fun verifyCode(code: String, input: String): Boolean {
+        val c = code.trim()
+        if (c.isEmpty()) return false
+        // 定长比较，跟校验手机凭证同一个理由：别让猜码的人从比对耗时里读出进度
+        return constantTimeEquals(input.trim(), c)
+    }
+
+    /**
+     * 是否还在免认证窗口内。
+     *
+     * 两个时间都用 elapsedRealtime（开机起算），**不用墙上时钟** ——
+     * 老电视的日期时间十有八九是错的，拿它算窗口会出现「刚输完又让我输」。
+     */
+    fun graceActive(lastOkMs: Long, nowMs: Long): Boolean =
+        lastOkMs > 0L && nowMs >= lastOkMs && nowMs - lastOkMs < GRACE_MS
+
+    /** 冷却还剩多少毫秒。返回 0 = 现在可以试 */
+    fun cooldownLeftMs(failStreak: Int, lastFailMs: Long, nowMs: Long): Long {
+        if (failStreak < TRY_LIMIT) return 0L
+        if (nowMs < lastFailMs) return 0L        // 时间倒流：当作没在冷却，别把人锁在门外
+        val left = COOLDOWN_MS - (nowMs - lastFailMs)
+        return if (left > 0L) left else 0L
+    }
+
+    /**
+     * 冷却过去之后把连错次数清零。冷却期内保持不变 ——
+     * 否则每敲一次都会从「现在」重新计时，冷却永远走不完。
+     */
+    fun failStreakAfterCooldown(failStreak: Int, lastFailMs: Long, nowMs: Long): Int =
+        if (cooldownLeftMs(failStreak, lastFailMs, nowMs) == 0L) 0 else failStreak
+
     // ==================== 登录凭证 ====================
 
     /** 签发凭证：`HMAC(码, 过期时间戳).过期时间戳`，跟网页后台同一套 */

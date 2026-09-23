@@ -41,7 +41,8 @@
             android:exported="true"
             android:launchMode="singleInstance"
             android:screenOrientation="landscape"
-            android:theme="@style/Theme.Signage">
+            android:theme="@style/Theme.Signage"
+            android:windowSoftInputMode="adjustResize">>
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

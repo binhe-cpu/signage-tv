@@ -18,6 +18,7 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.WindowManager
+import android.view.inputmethod.InputMethodManager
 import android.widget.ImageView
 import androidx.core.content.pm.PackageInfoCompat
 import androidx.core.view.WindowCompat
@@ -50,6 +51,8 @@ import java.util.Calendar
  * 这样那套游标逻辑能在 JVM 测试台里跑真实断言 —— View 层测不了，逻辑层必须测到。
  *
  * 呼出二维码有两条路，两条都通：触摸屏点一下屏幕，或者按遥控器「确定」键。
+ * 设了访问码之后，两条路都得先过一道认证（输对了才出码）—— 见 requestQr()。
+ * 没设访问码就跟以前完全一样，点一下就出。
  */
 @androidx.annotation.OptIn(UnstableApi::class)
 class MainActivity : Activity() {
@@ -85,6 +88,18 @@ class MainActivity : Activity() {
     /** 浮层是不是「因为没素材」自动弹出来的。是的话，一有内容就该收掉 */
     private var qrAutoShown = false
 
+    /** 认证浮层是不是「因为没素材」自动弹的。通过之后按这个意图决定二维码算不算自动 */
+    private var authAuto = false
+
+    /** 最近一次通过认证的时刻（elapsedRealtime）。0 = 还没通过过 */
+    private var qrAuthOkAt = 0L
+
+    /** 访问码连错几次。错够 TRY_LIMIT 次开始冷却 */
+    private var authFailStreak = 0
+
+    /** 最近一次输错的时刻（elapsedRealtime），冷却从它起算 */
+    private var authFailAt = 0L
+
     private val imageCache = object : LruCache<String, Bitmap>(
         (Runtime.getRuntime().maxMemory() / Config.IMAGE_CACHE_DIVISOR).toInt()
     ) {
@@ -105,6 +120,9 @@ class MainActivity : Activity() {
     /** 收起二维码浮层 */
     private val hideQr = Runnable { hideQrNow() }
 
+    /** 认证浮层也得自己收，不然有人点开就走开，这层框会一直挡着广告 */
+    private val hideAuthTask = Runnable { hideAuth() }
+
     /** 手机上传来新东西后，稍等一下再跳到它（一次传多个文件时避免反复跳） */
     private val jumpToManual = Runnable { applyBase(baseItems, jumpToFront = true) }
 
@@ -115,7 +133,7 @@ class MainActivity : Activity() {
             override fun onDown(e: MotionEvent): Boolean = true
 
             override fun onSingleTapUp(e: MotionEvent): Boolean {
-                toggleQrByTouch()
+                toggleQr()
                 return true
             }
         })
@@ -132,6 +150,19 @@ class MainActivity : Activity() {
 
         // 版本号：装到电视上以后，呼出二维码就能核对装的是哪一版
         binding.qrVersion.text = versionLabel()
+        binding.authGraceHint.text =
+            getString(R.string.auth_grace_hint, (UploadAuth.GRACE_MS / 60_000L).toInt())
+
+        // 认证浮层的三个口子：按钮、输入法上那颗「完成」、点浮层空白处取消。
+        // 触摸屏是主要路径（店里那台一体机没有遥控器），按钮够用；
+        // 遥控器机型走「输完按确定」和「返回键取消」。
+        binding.authOk.setOnClickListener { submitAuth() }
+        binding.authCancel.setOnClickListener { hideAuth() }
+        binding.authOverlay.setOnClickListener { hideAuth() }
+        binding.authInput.setOnEditorActionListener { _, _, _ ->
+            submitAuth()
+            true
+        }
 
         binding.imageView.scaleType =
             if (Config.IMAGE_FIT_CENTER) ImageView.ScaleType.FIT_CENTER
@@ -185,7 +216,11 @@ class MainActivity : Activity() {
         Log.i(Config.TAG, "素材根目录：${Storage.root(this).absolutePath}（${Storage.rootLabel(this)}）")
         Log.i(Config.TAG, "本地素材目录：${MediaLibrary.dir(this).absolutePath}")
         Log.i(Config.TAG, "手机上传目录：${MediaLibrary.manualDir(this).absolutePath}")
-        Log.i(Config.TAG, "触摸呼出二维码：${Config.TOUCH_TAP_ENABLED}")
+        Log.i(
+            Config.TAG,
+            "点屏呼二维码：触摸 ${Config.TOUCH_TAP_ENABLED}，" +
+                "需认证 ${UploadAuth.gateNeeded(readUploadCode())}"
+        )
         if (remoteConfigured) {
             Log.i(Config.TAG, "端侧配置：${RemoteConfig.configFile(this).absolutePath}")
         } else {
@@ -221,6 +256,7 @@ class MainActivity : Activity() {
         handler.removeCallbacks(rescanTask)
         handler.removeCallbacks(jumpToManual)
         hideQrNow()
+        hideAuth()
         uploadServer?.stop()
         // 退出前把游标标成"没在播"，回来时才会重新起播，而不是以为还在播
         seq.stopped()
@@ -277,18 +313,24 @@ class MainActivity : Activity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) hideSystemUi()
+        // 认证浮层开着的时候不收系统栏：显示/隐藏系统栏会来回触发这个回调，
+        // 把刚弹出来的软键盘顶掉，人就输不进码了
+        if (hasFocus && binding.authOverlay.visibility != View.VISIBLE) hideSystemUi()
     }
 
     /**
      * 触摸屏电视：点屏幕任意位置弹出/收起二维码，不用遥控器。
      *
-     * 这里把触摸事件整个吃下、不下发到子 View —— 界面上没有任何需要触摸的控件，
-     * 统一在 Activity 层处理，省得 PlayerView / ImageView 各自抢事件。
+     * 播放界面上没有任何需要触摸的控件，所以触摸事件整个吃下、统一在 Activity 层处理，
+     * 省得 PlayerView / ImageView 各自抢事件。唯一例外是认证浮层 —— 那上面有输入框和
+     * 两个按钮，事件得照常下发，所以它开着的时候直接放行。
      * 用 GestureDetector 而不是 setOnClickListener，是为了把「轻点」和「滑动」分开：
      * 有人擦屏幕、手蹭一下，不会误弹二维码。
      */
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        // 认证浮层上有输入框和两个按钮，事件必须正常下发到它们，不能在这儿吃掉
+        if (binding.authOverlay.visibility == View.VISIBLE) return super.dispatchTouchEvent(ev)
+
         if (Config.TOUCH_TAP_ENABLED) {
             tapDetector.onTouchEvent(ev)
             return true
@@ -298,27 +340,50 @@ class MainActivity : Activity() {
 
     /**
      * 遥控器按键：方向键全部吞掉，防止店员或顾客误触弹出菜单。
-     * 「确定」键用来切换二维码浮层，「菜单」键也能呼出。
+     * 「确定」键用来切换浮层，「菜单」键也能呼出；两个都先过认证那道门。
+     * 认证浮层开着时不走这套 —— 那时候按键要留给输入框。
      * 返回键故意保留，方便调试时退出；第 4 步做 Kiosk 时再彻底封掉。
      */
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean = when (keyCode) {
-        KeyEvent.KEYCODE_MENU -> {
-            showQr()
-            true
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        // 认证浮层开着的时候，按键先让输入框和按钮用：EditText 要收遥控器上的数字键、
+        // 方向键要在里面挪光标，所以这里只截「确定」和「返回」，其余原样下发。
+        if (binding.authOverlay.visibility == View.VISIBLE) {
+            return when (keyCode) {
+                KeyEvent.KEYCODE_BACK -> {
+                    hideAuth()
+                    true
+                }
+
+                KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_NUMPAD_ENTER,
+                KeyEvent.KEYCODE_DPAD_CENTER -> {
+                    submitAuth()
+                    true
+                }
+
+                else -> super.onKeyDown(keyCode, event)
+            }
         }
 
-        KeyEvent.KEYCODE_DPAD_CENTER,
-        KeyEvent.KEYCODE_ENTER -> {
-            if (binding.qrOverlay.visibility == View.VISIBLE) hideQrNow() else showQr()
-            true
+        return when (keyCode) {
+            KeyEvent.KEYCODE_MENU -> {
+                requestQr()
+                true
+            }
+
+            KeyEvent.KEYCODE_DPAD_CENTER,
+            KeyEvent.KEYCODE_ENTER -> {
+                toggleQr()
+                true
+            }
+
+            KeyEvent.KEYCODE_DPAD_UP,
+            KeyEvent.KEYCODE_DPAD_DOWN,
+            KeyEvent.KEYCODE_DPAD_LEFT,
+            KeyEvent.KEYCODE_DPAD_RIGHT -> true
+
+            else -> super.onKeyDown(keyCode, event)
         }
-
-        KeyEvent.KEYCODE_DPAD_UP,
-        KeyEvent.KEYCODE_DPAD_DOWN,
-        KeyEvent.KEYCODE_DPAD_LEFT,
-        KeyEvent.KEYCODE_DPAD_RIGHT -> true
-
-        else -> super.onKeyDown(keyCode, event)
     }
 
     private fun hideSystemUi() {
@@ -340,10 +405,152 @@ class MainActivity : Activity() {
 
     // ==================== 手机扫码上传 ====================
 
-    /** 触摸屏点一下：二维码开着就收起，没开就呼出 */
-    private fun toggleQrByTouch() {
+    /**
+     * 点屏 / 按确定键的统一入口：浮层开着就收起，没开就先过认证再出二维码。
+     */
+    private fun toggleQr() {
         if (!Config.UPLOAD_ENABLED) return
-        if (binding.qrOverlay.visibility == View.VISIBLE) hideQrNow() else showQr()
+
+        if (binding.qrOverlay.visibility == View.VISIBLE) {
+            hideQrNow()
+            return
+        }
+        // 认证浮层开着时，触摸和按键都直接走它自己那套（浮层内点击 / submitAuth），
+        // 正常到不了这儿。留着是兜底：万一漏进来也能收掉，别卡在那儿谁也动不了。
+        if (binding.authOverlay.visibility == View.VISIBLE) {
+            hideAuth()
+            return
+        }
+        requestQr()
+    }
+
+    /**
+     * 出二维码之前的那道门。
+     *
+     * 为什么要门：二维码就贴在店里这块屏上，谁走过都能扫一眼。扫到就能删素材、
+     * 改服务器地址、甚至把访问码关掉 —— 所以「看一眼二维码」本身得先证明是店里的人。
+     * 用的是手机页那同一个访问码（signage-upload.json），不再另造一套密码。
+     *
+     * 没设访问码就直接出码，跟以前一样：老电视、懒得设的场景零影响。
+     *
+     * @param auto true = 因为没素材自动亮的，通过后也要按「自动」算
+     */
+    private fun requestQr(auto: Boolean = false) {
+        if (!Config.UPLOAD_ENABLED) return
+        if (needAuth()) showAuth(auto) else showQr(auto)
+    }
+
+    /** 这次呼出要不要先认证：设了码、且不在免认证窗口内 */
+    private fun needAuth(): Boolean {
+        if (!UploadAuth.gateNeeded(readUploadCode())) return false
+        return !UploadAuth.graceActive(qrAuthOkAt, SystemClock.elapsedRealtime())
+    }
+
+    /**
+     * 读访问码。读不出来（没权限、文件坏了）当作没设 —— 宁可门开着，
+     * 也不能因为一个读不了的配置文件把自己锁在二维码外面。
+     */
+    private fun readUploadCode(): String =
+        runCatching { UploadAuth.readCode(UploadAuth.codeFile(this)) }.getOrDefault("")
+
+    /**
+     * 亮出认证浮层。已经开着就什么都不做 —— 它会被「没素材」那条路周期性命中，
+     * 每次重建都会把店员刚输进去的字符清掉。
+     */
+    private fun showAuth(auto: Boolean) {
+        if (binding.authOverlay.visibility == View.VISIBLE) return
+
+        authAuto = auto
+        binding.authInput.setText("")
+        binding.authError.text = ""
+        binding.authOverlay.visibility = View.VISIBLE
+        binding.qrOverlay.visibility = View.GONE
+        // 认证期间不该被「二维码两分钟自动收起」那条定时器牵连
+        handler.removeCallbacks(hideQr)
+        handler.removeCallbacks(hideAuthTask)
+        handler.postDelayed(hideAuthTask, Config.AUTH_AUTO_HIDE_MS)
+
+        // 沉浸模式下软键盘常常弹不出来，先让系统栏回来，收起时再藏回去
+        WindowInsetsControllerCompat(window, window.decorView)
+            .show(WindowInsetsCompat.Type.systemBars())
+
+        // 遥控器机型没有软键盘，靠 EditText 收数字键也能输；这里只是尽量把键盘叫出来
+        binding.authInput.post {
+            binding.authInput.requestFocus()
+            runCatching {
+                (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+                    .showSoftInput(binding.authInput, InputMethodManager.SHOW_IMPLICIT)
+            }
+        }
+        Log.i(Config.TAG, "呼出二维码前先要访问码")
+    }
+
+    /** 收起认证浮层。**不清认证状态** —— 已经通过的那次仍然算数 */
+    private fun hideAuth() {
+        if (binding.authOverlay.visibility != View.VISIBLE) {
+            handler.removeCallbacks(hideAuthTask)
+            return
+        }
+
+        handler.removeCallbacks(hideAuthTask)
+        authAuto = false
+        binding.authOverlay.visibility = View.GONE
+        binding.authInput.setText("")
+        binding.authError.text = ""
+        binding.authInput.clearFocus()
+        binding.root.requestFocus()
+        runCatching {
+            (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager)
+                .hideSoftInputFromWindow(binding.authInput.windowToken, 0)
+        }
+        hideSystemUi()
+    }
+
+    /**
+     * 提交访问码。
+     *
+     * 连错够次数就冷一段时间：屏就在店里、码又只有几位，不拦一下谁都能站着一直试。
+     */
+    private fun submitAuth() {
+        val now = SystemClock.elapsedRealtime()
+
+        val left = UploadAuth.cooldownLeftMs(authFailStreak, authFailAt, now)
+        if (left > 0L) {
+            binding.authError.text =
+                getString(R.string.auth_cooling, ((left + 999L) / 1000L).toInt())
+            return
+        }
+        // 冷却已经过去，连错次数从零重算
+        authFailStreak = UploadAuth.failStreakAfterCooldown(authFailStreak, authFailAt, now)
+
+        val code = readUploadCode()
+        if (!UploadAuth.gateNeeded(code)) {
+            // 输码这会儿有人把码文件删了（U 盘 / 电视文件管理器）—— 门已经开了，直接放行
+            Log.i(Config.TAG, "访问码已被删除，直接出二维码")
+            qrAuthOkAt = now
+            // hideAuth() 里会把 authAuto 复位，所以先把它记下来再收浮层
+            val auto = authAuto
+            hideAuth()
+            showQr(auto)
+            return
+        }
+
+        if (!UploadAuth.verifyCode(code, binding.authInput.text?.toString().orEmpty())) {
+            authFailStreak++
+            authFailAt = now
+            binding.authInput.setText("")
+            binding.authError.text = getString(R.string.auth_wrong)
+            Log.w(Config.TAG, "电视端输错访问码（第 $authFailStreak 次）")
+            return
+        }
+
+        qrAuthOkAt = now
+        authFailStreak = 0
+        Log.i(Config.TAG, "电视端认证通过，${UploadAuth.GRACE_MS / 1000} 秒内不用再输")
+        // 同上：hideAuth() 会复位 authAuto，先留一份
+        val auto = authAuto
+        hideAuth()
+        showQr(auto)
     }
 
     /**
@@ -614,9 +821,10 @@ class MainActivity : Activity() {
         val combined = manualItems() + newBase
 
         if (jumpToFront && combined.isNotEmpty()) {
-            // 刚在手机上点完上传：先收起二维码浮层，不然它盖着刚传进来的东西，
+            // 刚在手机上点完上传：先收起浮层，不然它盖着刚传进来的东西，
             // 一眼看上去就像"传了但没播"。
             hideQrNow()
+            hideAuth()
             seq.update(combined)
             // 播 0 而不是"最后传的那条"：manual 段按上传时间升序，从 0 开始正好把
             // 这一批刚传的从头挨个过一遍，用户能一次看全。别改成播最后一条。
@@ -665,7 +873,9 @@ class MainActivity : Activity() {
         seq.started(index)
         startAtMs = SystemClock.elapsedRealtime()
 
-        // 没素材时自动亮起的二维码，一有内容就收掉，别挡着画面
+        // 没素材时自动亮起的浮层，一有内容就收掉，别挡着画面。
+        // 认证那一层也算：有人在电脑上往目录里拷了素材，屏得能自己回到播放
+        if (authAuto) hideAuth()
         if (qrAutoShown) hideQrNow()
         binding.placeholder.visibility = View.GONE
 
@@ -770,8 +980,9 @@ class MainActivity : Activity() {
         binding.playerView.visibility = View.GONE
         binding.placeholder.text = text
         binding.placeholder.visibility = View.VISIBLE
-        // 没东西可播的时候，屏幕空着也是空着，直接把二维码亮出来
-        showQr(auto = true)
+        // 没东西可播的时候，屏幕空着也是空着，直接把二维码亮出来。
+        // 但设了访问码就得先认证 —— 否则把素材删空就能白拿到二维码，这门白设了
+        requestQr(auto = true)
     }
 
     /** 提前解码下一张图片，轮到它时就不会卡一下 */
@@ -838,6 +1049,9 @@ class MainActivity : Activity() {
         root.put("uploadCodeSet", runCatching {
             UploadAuth.readCode(UploadAuth.codeFile(this)).isNotEmpty()
         }.getOrDefault(false))
+        // 现在点屏要不要先输访问码 / 连错了没。电视上没法看日志，排错全靠这一段
+        root.put("qrAuthRequired", needAuth())
+        root.put("qrAuthFailStreak", authFailStreak)
 
         // 状态回传：电脑上那个后台看不到这块屏时，先看这一段 ——
         // 是"没往那儿报"，还是"报了但被拒了"，这两件事的修法完全不一样

@@ -6,4 +6,13 @@
     <string name="qr_hint">手机连上店里同一个 WiFi，用相机或微信扫上面的码，选好图片或视频直接传。传完电视会自动插播。</string>
     <string name="qr_close_hint">点击屏幕任意位置收起</string>
     <string name="qr_no_network">没有检测到局域网地址\n\n请先把电视接上店里的 WiFi 或网线</string>
+    <string name="auth_title">需要访问码</string>
+    <string name="auth_hint">这台屏开启了访问码，输对了才会显示上传二维码。</string>
+    <string name="auth_input_hint">访问码</string>
+    <string name="auth_ok">确定</string>
+    <string name="auth_cancel">取消</string>
+    <string name="auth_wrong">访问码不对，再试一次</string>
+    <string name="auth_cooling">输错太多次了，请等 %1$d 秒</string>
+    <string name="auth_grace_hint">通过后 %1$d 分钟内再点屏幕不用重输</string>
+    <string name="auth_rescue">忘了访问码：插 U 盘，或用电视自带的文件管理器，删掉 signage 目录里的 signage-upload.json，这里就恢复成不用访问码。</string>
 </resources>

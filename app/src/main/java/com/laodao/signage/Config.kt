@@ -6,7 +6,7 @@ package com.laodao.signage
 object Config {
 
     /** 版本号，只用于日志和 User-Agent，跟 build.gradle 的 versionName 手动保持一致 */
-    const val VERSION_NAME = "0.3.8"
+    const val VERSION_NAME = "0.3.9"
 
     // ===== 播放 =====
 
@@ -92,6 +92,13 @@ object Config {
 
     /** 二维码浮层多久自动隐藏（毫秒）。触屏上要掏手机、连 WiFi，留宽一点 */
     const val QR_AUTO_HIDE_MS = 120_000L
+
+    /**
+     * 认证浮层多久自动收起（毫秒）。
+     * 跟二维码一样留两分钟：输码本身要不了这么久，但不能让人输到一半被收掉。
+     * 没有这条的话，有人点开认证就走了，那层白框会一直盖着广告。
+     */
+    const val AUTH_AUTO_HIDE_MS = 120_000L
 
     // ===== 触摸屏 =====
 
