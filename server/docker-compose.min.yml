@@ -12,11 +12,13 @@
 # 1. 先把镜像弄进 NAS，四选一：
 #    a) **推荐**：直接拉。NAS 上执行
 #          docker pull ghcr.io/binhe-cpu/signage-tv:1.2.0
-#       这个包第一次发布默认是 private —— 拉不动就先登录一次：
-#          docker login ghcr.io -u <你的GitHub用户名>
-#       密码填一个有 read:packages 权限的 PAT（**不是**GitHub 登录密码）。
-#       嫌每次登录麻烦，就去 GitHub 的包设置里把它改成 public，之后匿名能拉
-#       （Package settings → Danger Zone → Change visibility）。
+#       这个包**是公开的，匿名就能拉，不用登录**（实测过）。
+#       万一拉不动，两个可能，按顺序排查：
+#         · 网络到不了 ghcr.io（国内常见）→ 直接走下面 b) 那条路，别耗在这儿
+#         · 包被设成了 private → GitHub 包设置里改回 public
+#           （Package settings → Danger Zone → Change visibility）
+#       真要登录的话：docker login ghcr.io -u <你的GitHub用户名>，密码填一个有
+#       read:packages 权限的 PAT（**不是**GitHub 登录密码）。
 #    b) 拉不通 ghcr.io（国内网络常见），就下文件导入：
 #       Release 里下 signage-admin-docker-1.2.0.tar.gz，
 #       传到 NAS → Container Manager → 映像 → 新增 → 从文件添加

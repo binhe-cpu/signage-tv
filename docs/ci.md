@@ -39,9 +39,9 @@
 docker pull ghcr.io/binhe-cpu/signage-tv:latest
 ```
 
-包第一次发布**默认是 private**：要匿名拉就去包设置里改成 public
-（Package settings → Danger Zone → Change visibility）。不改也行，拉之前
-`docker login ghcr.io` 填一个有 `read:packages` 权限的 PAT。
+包**是公开的，匿名就能拉**，不用登录（实测：不带任何凭据请求 manifest 返回 200）。
+万一拉不动，按顺序排两个可能：① 网络到不了 ghcr.io（国内最常见）；② 包被设成了
+private —— 去 `Package settings → Danger Zone → Change visibility` 改回 public。
 
 三个 tag 的区别：`latest` 和版本号（`1.2.0`）都跟着 main 走、每次 push 会覆盖；
 `sha-xxxxxxx` 钉死在某一次提交上，**不会被覆盖**，想冻结某一版就用它。

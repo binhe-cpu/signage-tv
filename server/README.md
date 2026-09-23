@@ -246,11 +246,10 @@ http://<NAS的IP>:8600/playlist.json
   ```bash
   docker pull ghcr.io/binhe-cpu/signage-tv:1.2.0
   ```
-  包第一次发布**默认是 private**，拉不动就先登录一次：
-  `docker login ghcr.io -u <你的GitHub用户名>`，密码填一个有 `read:packages`
-  权限的 PAT（**不是**GitHub 登录密码）。嫌每次登录麻烦，就去包设置里把它改成
-  public（Package settings → Danger Zone → Change visibility），之后匿名能拉。
-  > 拉不动还有个可能：**国内网络到 ghcr.io 不稳**。那就走下面第二条，别耗在这儿。
+  这个包**是公开的，匿名就能拉，不用登录**（实测过）。
+  > 万一拉不动，按顺序排两个可能：① **国内网络到 ghcr.io 不稳**（最常见）——
+  > 直接走下面第二条，别耗在这儿；② 包被设成了 private —— 去 GitHub 包设置里
+  > 改回 public（Package settings → Danger Zone → Change visibility）。
 - **拉不通 ghcr.io 就下文件**：`Releases` 页下载
   `signage-admin-docker-<版本>.tar.gz`（就是 `docker save` 出来的），
   传到 NAS → Container Manager → **映像 → 新增 → 从文件添加**。这条路 NAS 完全不用联外网

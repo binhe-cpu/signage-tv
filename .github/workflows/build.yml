@@ -422,10 +422,11 @@ jobs:
             echo '```'
             echo ""
             echo "包名 \`${GITHUB_REPOSITORY#*/}\`，在仓库右侧的 Packages 区能看到。"
-            echo "**第一次推上去默认是 private**：要匿名 pull 就去包设置里改成 public"
-            echo "（Package settings → Danger Zone → Change visibility）；"
-            echo "保持 private 也行，拉之前在 NAS 上 \`docker login ghcr.io\` 填一个有"
-            echo "\`read:packages\` 的 PAT。"
+            echo "**这个是公开包，匿名就能拉**（GitHub 文档说首次默认 private，但公开仓库"
+            echo "从 workflow 推的包实测是公开的）。万一拉不动，两个可能："
+            echo "  1) 包被设成 private 了 -> Package settings → Danger Zone → Change visibility"
+            echo "  2) 网络到不了 ghcr.io（国内常见）-> 用 Release 里的 tar.gz 导入"
+            echo "真要登录：docker login ghcr.io -u <用户名>，密码填有 read:packages 的 PAT。"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 导出镜像（群晖「映像 → 新增 → 从文件添加」直接用）
