@@ -1,0 +1,13 @@
+{
+  "defaults": {
+    "imageDurationSec": 8,
+    "muted": true
+  },
+  "items": [
+    { "file": "01_门店形象.jpg" },
+    { "file": "02_秋季促销.jpg", "durationSec": 10 },
+    { "file": "03_新品视频.mp4" },
+    { "file": "04_夜场活动.jpg", "startTime": "18:00", "endTime": "22:00" },
+    { "file": "05_周末特惠.jpg", "days": [6, 7] }
+  ]
+}

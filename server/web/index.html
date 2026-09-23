@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>门店屏 · 内容发布</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<h2 class="sr-only">门店屏内容发布后台：查看线上素材、调整播放顺序、上传新素材并发布到电视</h2>
+
+<div id="login" class="login hidden">
+  <div class="login-box">
+    <h1>门店屏</h1>
+    <p class="muted">输入访问码继续</p>
+    <input id="code" type="password" autocomplete="current-password" placeholder="访问码">
+    <button id="loginBtn" class="primary">进入</button>
+    <div id="loginErr" class="err"></div>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+  <header class="top">
+    <div class="top-main">
+      <h1>门店屏 · 内容发布</h1>
+      <div id="meta" class="muted small"></div>
+    </div>
+    <div class="top-acts">
+      <button id="codeBtn" class="ghost small-btn">安全设置</button>
+      <button id="logoutBtn" class="ghost small-btn">退出</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <main>
+    <section class="card" id="devCard">
+      <div class="card-head">
+        <h2>电视状态</h2>
+        <span id="devSum" class="muted small"></span>
+      </div>
+      <p class="muted small hint">每块屏隔一会儿自己上报一次，这里能看到谁在跑、在播哪一版。屏是好的但这里一台都没有，一般是：屏还没升到 v0.3.8，或者屏上填的清单地址不是这台服务器。</p>
+      <div id="devList"></div>
+      <div id="devSt" class="small"></div>
+    </section>
+
+    <section id="codeCard" class="card hidden">
+      <div class="card-head">
+        <h2>访问码</h2>
+        <span id="codeOrigin" class="muted small"></span>
+      </div>
+      <p class="muted small hint">访问码是进这个后台的钥匙。改完之后，别的设备（手机、另一台电脑）上的登录会立刻失效，得重新输新码；这台电脑不用重输。</p>
+      <label class="field sub">当前访问码
+        <input id="curCode" type="password" autocomplete="current-password" placeholder="再输一遍现在的码">
+      </label>
+      <label class="field sub">新访问码
+        <input id="newCode" type="password" autocomplete="new-password" placeholder="至少 4 位，中文也行">
+      </label>
+      <label class="field sub">新访问码再输一遍
+        <input id="newCode2" type="password" autocomplete="new-password">
+      </label>
+      <div class="btnrow">
+        <button id="saveCodeBtn" class="primary">保存访问码</button>
+        <button id="hideCodeBtn" class="ghost">收起</button>
+      </div>
+      <div id="codeMsg" class="small"></div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>播放顺序</h2>
+        <span id="orderCount" class="muted small"></span>
+      </div>
+      <ul id="orderList" class="list"></ul>
+      <div class="opts">
+        <label class="field">图片停留
+          <input id="imgDur" type="number" min="1" max="3600" value="8" inputmode="numeric"> 秒
+        </label>
+        <label class="field"><input id="muted" type="checkbox" checked> 静音</label>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head"><h2>添加素材</h2></div>
+      <div id="drop" class="drop">
+        <input id="file" type="file" multiple accept="image/*,video/*" hidden>
+        <button id="pickBtn" class="primary">选择文件</button>
+        <p class="muted small">或把文件拖到这里。支持图片和视频，可以多选。</p>
+        <label class="field sub">
+          放进子文件夹（可选）
+          <input id="subdir" type="text" placeholder="例如：国庆活动" autocapitalize="off"
+                 autocorrect="off" spellcheck="false">
+        </label>
+      </div>
+      <div id="upWrap" class="up hidden">
+        <div class="bar"><div id="upBar"></div></div>
+        <div id="upText" class="small"></div>
+        <ul id="upErrors" class="errlist"></ul>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>素材库</h2>
+        <span id="libCount" class="muted small"></span>
+      </div>
+      <p class="muted small hint">远端已有的全部素材。没在播放顺序里的就是「未使用」，下次发布不会出现在屏上。点缩略图或文件名可以看内容。</p>
+      <ul id="libList" class="list"></ul>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>电视端填什么</h2>
+        <span id="tvMode" class="muted small"></span>
+      </div>
+      <p id="tvHint" class="muted small hint"></p>
+      <div class="urlrow">
+        <a id="tvUrl" class="mono" target="_blank" rel="noreferrer"></a>
+        <button id="tvCopyBtn" class="ghost small-btn">复制</button>
+      </div>
+      <div id="tvCopyMsg" class="small"></div>
+      <p class="muted small hint">填的位置：电视上点一下屏幕，右下角会出二维码 → 手机扫码打开上传页 →
+        拉到最下面「服务器地址」→ 粘进去保存，刷新间隔 300 秒就行。</p>
+      <p class="muted small hint">点开上面这个地址应该看到一段 JSON。看到报错或者打不开，
+        说明还没发布过清单，或者这台电脑的防火墙没放行这个端口。</p>
+    </section>
+  </main>
+
+  <footer class="bottom">
+    <div id="pubMsg" class="small"></div>
+    <button id="publishBtn" class="primary wide">发布到电视</button>
+  </footer>
+</div>
+
+<div id="viewer" class="viewer hidden">
+  <div class="viewer-box">
+    <div class="viewer-head">
+      <div class="viewer-title">
+        <div id="vName"></div>
+        <div id="vMeta" class="muted small"></div>
+      </div>
+      <button id="vClose" class="ghost small-btn">关闭</button>
+    </div>
+    <div id="vStage" class="viewer-stage"></div>
+    <div class="viewer-foot">
+      <button id="vPrev" class="small-btn">上一个</button>
+      <span id="vPos" class="muted small"></span>
+      <button id="vNext" class="small-btn">下一个</button>
+      <a id="vOpen" class="linkbtn" target="_blank" rel="noopener">新窗口打开</a>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>

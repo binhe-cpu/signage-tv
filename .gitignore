@@ -1,0 +1,35 @@
+*.iml
+.gradle/
+build/
+local.properties
+.idea/
+.DS_Store
+captures/
+.externalNativeBuild/
+.cxx/
+
+# 网页后台打包产物（signage-admin.exe 有 27MB，不进仓库）
+server/dist/
+
+# Python 缓存
+__pycache__/
+*.pyc
+.venv/
+
+# 运行时状态：访问码、设备台账。这是「跑起来之后才有的东西」，
+# 而且台账里带真实设备名和 IP，不该进版本库。
+server/data/
+server/site/
+signage-server.json
+
+# 本机专属的构建配置（python 装在哪各人不同，复制 .example 改一下）
+/local-env.bat
+
+# 设备侧配置（含现场地址/访问码，各台屏不一样）
+signage-remote.json
+signage-upload.json
+
+# 日志与临时文件
+*.log
+*.tmp
+*.part

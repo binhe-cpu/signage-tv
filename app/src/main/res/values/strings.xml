@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">门店屏</string>
+    <string name="placeholder_empty">还没有素材</string>
+    <string name="qr_title">手机扫码上传素材</string>
+    <string name="qr_hint">手机连上店里同一个 WiFi，用相机或微信扫上面的码，选好图片或视频直接传。传完电视会自动插播。</string>
+    <string name="qr_close_hint">点击屏幕任意位置收起</string>
+    <string name="qr_no_network">没有检测到局域网地址\n\n请先把电视接上店里的 WiFi 或网线</string>
+</resources>

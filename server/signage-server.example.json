@@ -1,0 +1,24 @@
+{
+  "_说明": [
+    "这是 exe 旁边的启动配置，改名成 signage-server.json 就生效（放在 exe 同一个目录里）。",
+    "双击 exe 的时候命令行是空的、环境变量也等于没有，参数只能从这儿来。",
+    "优先级：命令行 > 环境变量 > 这个文件 > 内置默认。所以这里写错了还能用命令行覆盖回去。",
+    "不想要哪一条就整行删掉，别留着空字符串顶掉默认值（空字符串等于没给）。",
+    "storage 一个都不给时，exe 会默认发到它旁边的 site/ 目录，本机做演示够用。",
+    "本文件里所有字段都是可选的。"
+  ],
+
+  "storage": "local:D:/web/signage",
+
+  "host": "0.0.0.0",
+  "port": 8600,
+
+  "adminCode": "",
+
+  "playlist": "playlist.json",
+  "assetBaseUrl": "",
+
+  "publicRead": true,
+
+  "reportToken": ""
+}

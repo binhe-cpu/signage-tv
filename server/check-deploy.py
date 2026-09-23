@@ -1,0 +1,451 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+门店屏网页后台 · 容器化自检
+
+改完 docker-compose.yml / Dockerfile 之后跑一遍（**不需要装 Docker**）：
+
+    python check-deploy.py
+    python check-deploy.py --python D:/clean/Scripts/python.exe     # 指定解释器
+
+它干三件事：
+
+  1. 校验 compose / Dockerfile 的语法和关键字段（有 pyyaml 就查得细一些）
+  2. **照着 Dockerfile 里 COPY 的那几行**，在临时目录里搭一份群晖上的目录布局，
+     多一个文件都不拷
+  3. 用这份布局起一次真服务，走一遍本地目录模式的主要路径
+
+第 2、3 步是重点，而且第 2 步是**从 Dockerfile 里解析出来的**，不是手写的清单 ——
+所以它验的就是 Dockerfile 本身。漏拷 web/ 的表现是页面 404，漏拷 tools/ 的表现
+是启动就报 import 错，这两种都得在 NAS 上折腾半天才看得出来，在这儿先卡住。
+
+想连「官方 python 镜像里没有 boto3，本地目录模式照样能跑」一起验，
+就用一个干净的、没装过第三方包的解释器来跑本脚本：
+
+    python -m venv --without-pip D:/clean
+    D:/clean/Scripts/python.exe check-deploy.py
+"""
+
+from __future__ import annotations
+
+import argparse
+import http.cookiejar
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent
+COMPOSE = HERE / "docker-compose.yml"
+DOCKERFILE = HERE / "Dockerfile"
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+class Checker:
+    def __init__(self):
+        self.fails = []
+        self.n = 0
+
+    def ok(self, name, cond, extra=""):
+        self.n += 1
+        if cond:
+            say(f"  ok   {name}")
+        else:
+            say(f"  FAIL {name}" + (f"  —— {extra}" if extra else ""))
+            self.fails.append(name)
+
+    def done(self):
+        say("")
+        if self.fails:
+            say(f"{self.n} 项里失败 {len(self.fails)} 项：")
+            for f in self.fails:
+                say(f"  - {f}")
+            return False
+        say(f"{self.n} 项全过")
+        return True
+
+
+def free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+# ---------------------------------------------------------------- 一、静态校验
+
+def parse_copies(text: str):
+    """从 Dockerfile 里抠出 COPY 指令，还原成 [(源, 目标目录)]
+
+    Docker 的语义：目标以 / 结尾就是目录，源文件拷进去之后保持自己的名字；
+    源是目录就把它**里面的东西**拷进目标。这里按这个规则还原成实际落点。
+    """
+    out = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.upper().startswith("COPY "):
+            continue
+        parts = line.split()[1:]
+        if len(parts) < 2:
+            continue
+        srcs, dst = parts[:-1], parts[-1]
+        for s in srcs:
+            out.append((s, dst))
+    return out
+
+
+def check_files(c) -> list:
+    say("一、compose / Dockerfile 的语法与关键字段")
+
+    df = DOCKERFILE.read_text(encoding="utf-8")
+    c.ok("Dockerfile 存在且基于 python:3.12-slim", "FROM python:3.12-slim" in df)
+    c.ok("Dockerfile 会装 boto3（对象存储模式要靠它）", "boto3" in df)
+    c.ok("Dockerfile 设了 PYTHONDONTWRITEBYTECODE（代码是只读挂载）",
+         "PYTHONDONTWRITEBYTECODE" in df)
+    c.ok("Dockerfile 声明了 /data 和 /site 两个卷",
+         'VOLUME ["/data", "/site"]' in df)
+    c.ok("Dockerfile 暴露 8600", "EXPOSE 8600" in df)
+
+    copies = parse_copies(df)
+    c.ok("Dockerfile 里能解析出 COPY 指令", bool(copies), str(copies))
+    for src, _ in copies:
+        c.ok(f"COPY 的源存在：{src}", (ROOT / src.rstrip("/")).exists())
+
+    text = COMPOSE.read_text(encoding="utf-8")
+    try:
+        import yaml
+    except ImportError:
+        say("  （没装 pyyaml，只做文本层面的检查；pip install pyyaml 能查得更细）")
+        for want, why in (("./app:/app:ro", "代码"), ("./data:/data", "数据"),
+                          ("./site:/site", "素材"), ("8600:8600", "端口")):
+            c.ok(f"compose 里有 {why} 的配置", want in text)
+        return copies
+
+    try:
+        data = yaml.safe_load(text)
+    except Exception as e:
+        c.ok("compose 能被 YAML 解析", False, str(e))
+        return copies
+    c.ok("compose 能被 YAML 解析", isinstance(data, dict))
+
+    svc = data.get("services") or {}
+    s = svc.get("signage-admin") or {}
+    c.ok("有一个叫 signage-admin 的 service", bool(s), f"实际有 {list(svc)}")
+    c.ok("没有过时的 version 字段（新版 compose 会告警）", "version" not in data)
+    c.ok("image 指向官方 python 镜像",
+         str(s.get("image", "")).startswith("python:"), str(s.get("image")))
+    c.ok("restart 是 unless-stopped（NAS 重启后自己起来）",
+         s.get("restart") == "unless-stopped", str(s.get("restart")))
+
+    vols = s.get("volumes") or []
+    for want, why in (("./app:/app:ro", "代码目录（只读）"),
+                      ("./data:/data", "数据目录"),
+                      ("./site:/site", "素材目录"),
+                      ("/etc/localtime:/etc/localtime:ro", "时区")):
+        c.ok(f"挂了{why}", want in vols, str(vols))
+
+    env = s.get("environment") or {}
+    if isinstance(env, list):
+        env = dict(x.split("=", 1) for x in env if "=" in x)
+    c.ok("SIGNAGE_DATA_DIR 指向 /data",
+         env.get("SIGNAGE_DATA_DIR") == "/data", repr(env.get("SIGNAGE_DATA_DIR")))
+    c.ok("SIGNAGE_STORAGE 是 local:/site",
+         env.get("SIGNAGE_STORAGE") == "local:/site", repr(env.get("SIGNAGE_STORAGE")))
+    adv = str(env.get("SIGNAGE_ADVERTISE_BASE") or "").strip()
+    c.ok("设了 SIGNAGE_ADVERTISE_BASE（容器里不设，日志会打容器内网地址）", bool(adv))
+    c.ok("SIGNAGE_ADVERTISE_BASE 是 http:// 开头的完整地址",
+         adv.startswith("http://") and ":" in adv, adv)
+    c.ok("SIGNAGE_ADVERTISE_BASE 不是占位默认值（127.0.0.1 电视连不上）",
+         "127.0.0.1" not in adv and "localhost" not in adv, adv)
+    c.ok("没有误设 SIGNAGE_REPORT_TOKEN（端侧没地方填它）",
+         not str(env.get("SIGNAGE_REPORT_TOKEN") or "").strip())
+
+    ports = s.get("ports") or []
+    c.ok("端口映射到了 8600", any(str(p).endswith(":8600") for p in ports), str(ports))
+    c.ok("有健康检查", bool(s.get("healthcheck")))
+    cmd = s.get("command") or []
+    c.ok("启动命令指向 /app/server/signage_admin.py",
+         any("/app/server/signage_admin.py" in str(x) for x in cmd), str(cmd))
+    return copies
+
+
+# ---------------------------------------------------------------- 二、搭布局
+
+def build_layout(tmp: Path, copies) -> None:
+    """照 Dockerfile 的 COPY 清单把文件摆好，位置跟容器里一模一样"""
+    for src, dst in copies:
+        s = ROOT / src.rstrip("/")
+        target = tmp / dst.lstrip("/")
+        if s.is_dir():
+            shutil.copytree(s, target, dirs_exist_ok=True)
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(s, target / s.name)
+    # 群晖上这两个是空目录，容器里对应挂载点
+    (tmp / "data").mkdir(exist_ok=True)
+    (tmp / "site").mkdir(exist_ok=True)
+
+
+# ---------------------------------------------------------------- HTTP 客户端
+
+class Client:
+    def __init__(self, port: int, cookies: bool = True):
+        self.base = f"http://127.0.0.1:{port}"
+        if cookies:
+            self.jar = http.cookiejar.CookieJar()
+            self.opener = urllib.request.build_opener(
+                urllib.request.HTTPCookieProcessor(self.jar))
+        else:
+            # 电视端的角色：不带任何登录凭证
+            self.opener = urllib.request.build_opener()
+
+    def _send(self, path, data, method, headers, timeout):
+        r = urllib.request.Request(self.base + path, data=data, method=method,
+                                   headers=dict(headers or {}))
+        try:
+            with self.opener.open(r, timeout=timeout) as resp:
+                return resp.status, resp.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def req(self, path, method="GET", body=None, headers=None, timeout=20):
+        data, hdrs = None, dict(headers or {})
+        if body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            hdrs["Content-Type"] = "application/json"
+        return self._send(path, data, method, hdrs, timeout)
+
+    def req_raw(self, path, blob, method="POST", headers=None, timeout=30):
+        return self._send(path, blob, method, headers, timeout)
+
+
+class Runner:
+    """起一个真服务子进程，顺便把它的日志收着 —— 起不来的时候全靠它说明问题"""
+
+    def __init__(self, py, script: Path, env, port: int, cwd: Path):
+        self.port = port
+        self.lines = []
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        self.p = subprocess.Popen(
+            [str(py), str(script), "--host", "127.0.0.1", "--port", str(port)],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=env, cwd=str(cwd), creationflags=flags,
+        )
+        self.t = threading.Thread(target=self._drain, daemon=True)
+        self.t.start()
+
+    def _drain(self):
+        try:
+            for line in self.p.stdout:
+                self.lines.append(line.rstrip())
+        except Exception:
+            pass
+
+    def wait(self, timeout=30.0) -> bool:
+        end = time.time() + timeout
+        while time.time() < end:
+            if self.p.poll() is not None:
+                return False
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), 0.4):
+                    return True
+            except OSError:
+                time.sleep(0.15)
+        return False
+
+    def log(self) -> str:
+        return "\n".join(self.lines)
+
+    def stop(self):
+        try:
+            self.p.terminate()
+            self.p.wait(timeout=8)
+        except Exception:
+            try:
+                self.p.kill()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------- 三、真跑一遍
+
+def check_runtime(c, py: Path, copies) -> None:
+    say("")
+    say("三、只拿 Dockerfile 拷的那几个文件，起一次真服务")
+
+    tmp = Path(tempfile.mkdtemp(prefix="signage-deploy-"))
+    runs = []
+    try:
+        build_layout(tmp, copies)
+        app = tmp / "app"
+
+        env = os.environ.copy()
+        env["SIGNAGE_DATA_DIR"] = str(tmp / "data")
+        env["SIGNAGE_STORAGE"] = "local:" + str(tmp / "site")
+        env["SIGNAGE_ADVERTISE_BASE"] = "http://10.9.9.9:7700"
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        # 这几个不能让外面的环境漏进来，不然验的就不是默认行为了
+        for k in ("SIGNAGE_ADMIN_CODE", "SIGNAGE_PUBLIC_READ", "SIGNAGE_REPORT_TOKEN",
+                  "SIGNAGE_PLAYLIST", "SIGNAGE_HOST", "SIGNAGE_PORT"):
+            env.pop(k, None)
+
+        script = app / "server" / "signage_admin.py"
+        port = free_port()
+        # cwd 设成 app/ —— 对应容器里的 WORKDIR /app
+        run = Runner(py, script, env, port, cwd=app)
+        runs.append(run)
+
+        up = run.wait(30)
+        c.ok("仅凭这几个文件就能起来（文件没漏拷）", up,
+             "\n" + run.log()[-1200:] if not up else "")
+        if not up:
+            return
+
+        # 端口能连上不代表日志已经打完了：启动提示是在 bind 之后才 print 的，
+        # 而 TCP 握手只要内核 backlog 就成。松一口气再读，免得偶发抓空
+        time.sleep(0.8)
+        text = run.log()
+        c.ok("启动日志里用的是 SIGNAGE_ADVERTISE_BASE 给的地址",
+             "http://10.9.9.9:7700" in text, text[-600:])
+        c.ok("启动日志里没有漏出容器内网地址那类假地址",
+             "172.17." not in text, text[-600:])
+        c.ok("日志里打印了电视端该填的地址",
+             f"http://10.9.9.9:7700/" in text, text[-600:])
+
+        cl = Client(port)
+        st, _ = cl.req("/api/health")
+        c.ok("探活接口通", st == 200, f"status={st}")
+
+        st, body = cl.req("/")
+        html = body.decode("utf-8", "replace")
+        c.ok("页面能打开（web/ 没漏拷）",
+             st == 200 and "<html" in html.lower(), f"status={st} len={len(body)}")
+        st, body = cl.req("/app.js")
+        c.ok("静态资源能取到", st == 200 and len(body) > 200, f"status={st}")
+
+        code_file = tmp / "data" / "code.json"
+        c.ok("数据目录里落了访问码", code_file.is_file(), str(code_file))
+        code = json.loads(code_file.read_text(encoding="utf-8"))["code"]
+
+        st, _ = cl.req("/api/login", method="POST", body={"code": code})
+        c.ok("用数据目录里的码能登录", st == 200, f"status={st}")
+
+        st, body = cl.req("/api/state")
+        c.ok("状态接口通（tools/signage_core.py 没漏拷）",
+             st == 200 and b'"ok"' in body, f"status={st} {body[:160]!r}")
+
+        blob = b"\xff\xd8\xff\xe0" + b"fake-jpeg" * 64
+        st, body = cl.req_raw("/api/upload?name=t1.jpg", blob)
+        c.ok("能上传素材（本地模式的代传通道）",
+             st == 200, f"status={st} {body[:160]!r}")
+
+        st, body = cl.req("/api/publish", method="POST",
+                          body={"items": [{"file": "t1.jpg"}], "imageDurationSec": 8})
+        c.ok("能发布清单", st == 200, f"status={st} {body[:200]!r}")
+
+        # 电视端：不带任何登录凭证
+        tv = Client(port, cookies=False)
+        st, body = tv.req("/playlist.json")
+        c.ok("电视端免登录就能拉到清单",
+             st == 200 and b"t1.jpg" in body, f"status={st} {body[:200]!r}")
+        st, body = tv.req("/t1.jpg")
+        c.ok("电视端免登录就能拉到素材",
+             st == 200 and len(body) == len(blob), f"status={st} len={len(body)}")
+
+        st, _ = tv.req("/api/report", method="POST",
+                       body={"device": "群晖冒烟", "version": "0.3.8", "revision": 1})
+        c.ok("屏能免登录上报状态", st == 200, f"status={st}")
+
+        st, body = cl.req("/api/devices")
+        c.ok("页面上能看到这台屏",
+             st == 200 and "群晖冒烟" in body.decode("utf-8", "replace"),
+             f"status={st} {body[:200]!r}")
+
+        # 重启一遍：数据得真的落在文件里，不是活在内存里
+        run.stop()
+        port2 = free_port()
+        run2 = Runner(py, script, {**env, "SIGNAGE_ADVERTISE_BASE": "http://10.9.9.9:7701"},
+                      port2, cwd=app)
+        runs.append(run2)
+        up2 = run2.wait(30)
+        c.ok("重启能起来", up2, "\n" + run2.log()[-800:] if not up2 else "")
+        if up2:
+            cl2 = Client(port2)
+            st, _ = cl2.req("/api/login", method="POST", body={"code": code})
+            c.ok("重启后还是同一个访问码（没退化成每次换码）", st == 200, f"status={st}")
+            st, body = cl2.req("/api/devices")
+            c.ok("重启后台账还在",
+                 st == 200 and "群晖冒烟" in body.decode("utf-8", "replace"),
+                 f"status={st}")
+    finally:
+        for r in runs:
+            r.stop()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- 入口
+
+def probe(py: Path) -> str:
+    """看看这个解释器是什么来头 —— 有没有 boto3 决定了这次验的是不是零依赖环境"""
+    code = ("import sys;print('Python ' + sys.version.split()[0]);"
+            "\ntry:\n import boto3;print('boto3: 有')\nexcept Exception:print('boto3: 没有')")
+    try:
+        r = subprocess.run([str(py), "-c", code], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=30)
+        return (r.stdout or "").strip().replace("\n", "，")
+    except Exception as e:
+        return f"（探不出来：{e}）"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="门店屏网页后台 · 容器化自检")
+    ap.add_argument("--python", default=sys.executable,
+                    help="用哪个解释器起服务（默认当前这个）")
+    args = ap.parse_args()
+
+    py = Path(args.python)
+    if not py.exists():
+        raise SystemExit(f"！找不到这个解释器：{py}")
+
+    say("门店屏网页后台 · 容器化自检")
+    say(f"  解释器：{py}")
+    about = probe(py)
+    say(f"  自述：  {about}")
+    if "boto3: 没有" not in about:
+        say("  提示：这个解释器装了 boto3，验不出「零依赖」那件事。")
+        say("        想连那个一起验，就用一个干净解释器跑：")
+        say("        python -m venv --without-pip D:/clean")
+        say("        D:/clean/Scripts/python.exe check-deploy.py")
+    say("")
+
+    c = Checker()
+    copies = check_files(c)
+    if not copies:
+        say("")
+        say("Dockerfile 里解析不出 COPY，后面的真机验证没法做。")
+        raise SystemExit(not c.done())
+
+    check_runtime(c, py, copies)
+    say("")
+    good = c.done()
+    if not good:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

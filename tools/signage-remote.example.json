@@ -1,0 +1,7 @@
+{
+  "playlistUrl": "https://mybucket-1250000000.cos.ap-shanghai.myqcloud.com/signage/playlist.json",
+  "device": "",
+  "refreshIntervalSec": 300,
+  "prune": true,
+  "assetBaseUrl": ""
+}

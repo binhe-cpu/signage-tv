@@ -1,0 +1,112 @@
+# 门店屏网页后台 · 群晖 Container Manager 用
+#
+# 这条路是「零构建」的：直接用官方 python 镜像挂代码，不装任何第三方包。
+# 素材存在 NAS 本地目录（local 模式）用不到 boto3，所以连 pip 都不需要。
+# 想改用对象存储（COS/OSS）见文件末尾。
+#
+# ── 怎么用 ──────────────────────────────────────────────
+# 1. 在 NAS 上建项目文件夹，比如 docker 共享文件夹下的 signage/，
+#    把工程里的 server/ 和 tools/ 两个目录**整个**拷进去，再建两个空目录。
+#    放完长这样：
+#        signage/
+#          docker-compose.yml      ← 这个文件
+#          app/
+#            server/signage_admin.py
+#            server/backend.py
+#            server/web/…
+#            tools/signage_core.py
+#          data/                   ← 空目录就行，访问码和台账会写这里
+#          site/                   ← 空目录就行，发布的清单和素材放这里
+#    （下面所有 ./ 开头的路径都是按**这个文件所在的目录**算的，
+#      所以整个文件夹可以随便挪位置、随便换卷号，不用改配置）
+# 2. 改下面标了 ★ 的那一行，填这台 NAS 的局域网 IP
+# 3. Container Manager → 项目 → 新增 → 路径选这个文件夹 → 启动
+#
+# 页面地址：http://<NAS的IP>:8600/
+# 第一次启动的访问码在容器日志里（Container Manager 里点容器 → 日志）
+
+services:
+  signage-admin:
+    # 官方镜像，多架构（x86 和 ARM 的群晖都是同一个 tag）
+    image: python:3.12-slim
+    container_name: signage-admin
+
+    # NAS 重启、容器崩了都自己拉起来。除非在界面上手动停，否则一直跑
+    restart: unless-stopped
+
+    volumes:
+      # 代码。只读挂载——运行期不需要改它，也让容器没法写坏它
+      - ./app:/app:ro
+      # 访问码、设备台账。**别丢这个目录**，丢了访问码要重设、十块屏的记录清空
+      - ./data:/data
+      # 发布的清单和素材。电视端就是从这里拉的
+      - ./site:/site
+      # 跟 NAS 走同一时区，不然日志里那行时间差 8 小时
+      - /etc/localtime:/etc/localtime:ro
+
+    environment:
+      # ★ 改这里：填这台 NAS 在局域网里的地址（电视和电脑在的那个网段）。
+      #
+      # 为什么不自动取：容器里探到的「本机 IP」是容器自己的小网络地址（172.x），
+      # 跟你的局域网是隔开的，电视连不上。所以必须把真实地址告诉它。
+      # 这个值只影响日志和启动提示里显示的地址 —— 页面上那张「电视端填什么」
+      # 卡片是按浏览器地址栏算的，不受这里影响。所以填错了不影响播放，只是
+      # 日志里的地址看着不对。
+      SIGNAGE_ADVERTISE_BASE: "http://192.33.15.4:8600"
+
+      SIGNAGE_DATA_DIR: /data
+      SIGNAGE_STORAGE: "local:/site"
+
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+
+      # 访问码。不设的话：第一次启动随机生成一个打进日志，之后存在 data/code.json
+      # 里、重启不变，也能在页面上改。想固定死（页面上就改不了）就把下面放开。
+      # 忘了码：删掉 data/code.json 重启，会生成一个新的并打进日志
+      # SIGNAGE_ADMIN_CODE: "换成你自己的访问码"
+
+      # 状态上报口令。**默认不要设** —— 端侧没地方填它，设了十块屏会静默报不上来。
+      # 只有把这个端口暴露到公网时才需要
+      # SIGNAGE_REPORT_TOKEN: ""
+
+    command:
+      ["python3", "/app/server/signage_admin.py", "--host", "0.0.0.0", "--port", "8600"]
+
+    ports:
+      # 左边是 NAS 上的端口，想换就改左边（右边别动）。改完页面地址跟着变
+      - "8600:8600"
+
+    healthcheck:
+      test:
+        ["CMD", "python3", "-c",
+         "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8600/api/health',timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+# ── 要用对象存储（COS/OSS）时 ─────────────────────────────
+# 上面那套用的是官方镜像、不装 boto3，所以只支持本地目录模式。
+# 要发到对象存储就把 image: 那行换成下面的 build:，
+# 让它在 NAS 上现场构建一个装了 boto3 的镜像（构建一次，以后都复用）：
+#
+#     build:
+#       context: ./app
+#       dockerfile: server/Dockerfile
+#
+# 然后环境变量补上这几条：
+#
+#     SIGNAGE_STORAGE: "s3://你的桶名-1250000000/signage"
+#     SIGNAGE_S3_ENDPOINT: "https://cos.ap-shanghai.myqcloud.com"
+#     SIGNAGE_S3_REGION: "ap-shanghai"
+#     AWS_ACCESS_KEY_ID: "COS 的 SecretId"
+#     AWS_SECRET_ACCESS_KEY: "COS 的 SecretKey"
+#
+# 对象存储模式下电视端直连桶，site/ 那个挂载就用不上了（留着也无害）。
+# 构建慢的话给 Dockerfile 传个 pip 源：
+#     build:
+#       context: ./app
+#       dockerfile: server/Dockerfile
+#       args:
+#         PIP_INDEX: "https://pypi.tuna.tsinghua.edu.cn/simple"
