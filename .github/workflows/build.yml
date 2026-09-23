@@ -1,0 +1,224 @@
+# ============================================================
+#  推上来就自动编译两样东西
+#
+#    · 安卓 APK   —— ubuntu + JDK 17 + Android SDK 34
+#    · 网页后台 exe —— windows + PyInstaller 单文件
+#
+#  另外顺手跑服务端自测。这一条有个额外价值：runner 是 Linux，
+#  跟群晖 NAS 是同一个环境，所以「能不能在 Linux 上跑」不用等到
+#  真机上才发现。
+#
+#  ── 怎么用 ──────────────────────────────────────────────
+#  平时：改完 push 到 main，自动编译。结果在仓库的 Actions 页看，
+#        产物在该次运行页面下方的 Artifacts 里下载（要登录）。
+#  发版：打一个 v 开头的 tag 推上来，会自动建 Release 并把两个产物
+#        挂出去（Release 附件谁都能直接下载，不用登录）：
+#            git tag v0.3.9 && git push origin v0.3.9
+#  手动：Actions 页面选这个工作流 -> Run workflow。
+# ============================================================
+
+name: 构建
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 默认只读。要写仓库的只有最后那个发 Release 的 job，它自己声明提权
+permissions:
+  contents: read
+
+# 同一个分支连着推两次，把前一次没跑完的取消掉，省额度
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ----------------------------------------------------------
+  #  1) 安卓 APK
+  # ----------------------------------------------------------
+  apk:
+    name: 安卓 APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: 装 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 装 SDK 34（compileSdk 要的就是这个版本）
+        run: |
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          sdkmanager --list_installed | head -20
+
+      - name: 读出本次版本号
+        id: ver
+        run: |
+          V=$(grep -oP '^val appVersionName = "\K[^"]+' app/build.gradle.kts)
+          C=$(grep -oP '^val appVersionCode = \K[0-9]+' app/build.gradle.kts)
+          if [ -z "$V" ] || [ -z "$C" ]; then
+            echo "！没能从 app/build.gradle.kts 里读出版本号，检查那两行还在不在"
+            exit 1
+          fi
+          echo "name=$V" >> "$GITHUB_OUTPUT"
+          echo "code=$C" >> "$GITHUB_OUTPUT"
+          echo "本次版本：$V ($C)"
+
+      # 为什么要这一步：AGP 默认的 debug 签名是「每台机器各自生成一个」。
+      # 不固定的话，CI 打的 APK 和你在本机 build.bat 打的 APK 签名不同，
+      # 装在同一个电视上会互相覆盖不了（系统报「应用未安装」，看不出原因）。
+      # 把本机那个 debug.keystore 存成仓库 secret，两边就一致了。
+      - name: 装上固定签名
+        env:
+          KEYSTORE_B64: ${{ secrets.DEBUG_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            mkdir -p "$HOME/.android"
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$HOME/.android/debug.keystore"
+            echo "已装入固定的 debug keystore —— 这个 APK 能和本机构建的互相覆盖安装"
+          else
+            echo "::notice title=用的是临时签名::没配 DEBUG_KEYSTORE_BASE64。"
+            echo "APK 本身能装能跑，但不能覆盖本机构建的那个（换着装要先卸载）。"
+            echo "想固定签名：见 docs/ci.md。"
+          fi
+
+      - name: 编译 debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: 顺便跑 lint（只报告，不拦构建）
+        continue-on-error: true
+        run: ./gradlew :app:lintDebug --no-daemon
+
+      - name: 看看产物
+        run: ls -lh app/build/outputs/apk/debug/
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: signage-apk-${{ steps.ver.outputs.name }}-${{ steps.ver.outputs.code }}
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  # ----------------------------------------------------------
+  #  2) 网页后台 exe
+  # ----------------------------------------------------------
+  exe:
+    name: 网页后台 exe
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # boto3 是「要用对象存储模式」才需要的，但既然要打 exe，就一起打进去，
+      # 免得在别的电脑上才发现 s3 模式用不了
+      - name: 装 PyInstaller 和 boto3
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller boto3
+          python -c "import PyInstaller, boto3; print('PyInstaller', PyInstaller.__version__, '| boto3', boto3.__version__)"
+
+      # 这一步里带的 19 项冒烟测试才是重点：它会把 exe 真启动起来，
+      # 验网页能打开（证明 web/ 打进包了）、数据落在 exe 旁边（不是临时解包目录）。
+      # 这两种毛病编译期都看不出来，只有真跑一次才现形。
+      - name: 打包 + 冒烟测试
+        shell: bash
+        run: |
+          cd server
+          python build-exe.py --work "$RUNNER_TEMP/pi-work" --dist "$RUNNER_TEMP/pi-dist"
+
+      - name: 上传 exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: signage-admin-exe
+          path: server/dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  # ----------------------------------------------------------
+  #  3) 服务端自测
+  #     价值：runner 是 Linux，跟群晖同一个环境。
+      #     check-deploy.py 会按 Dockerfile 里的 COPY 清单搭一份一模一样的
+      #     目录布局再起真服务 —— 漏拷文件当场暴露，不用等到 NAS 上。
+  # ----------------------------------------------------------
+  server-tests:
+    name: 服务端自测（Linux）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 取代码
+        uses: actions/checkout@v4
+
+      - name: 装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装依赖
+        run: python -m pip install boto3 pyyaml
+
+      - name: 服务端自测
+        working-directory: server
+        run: python selftest.py
+
+      - name: 部署自检
+        working-directory: server
+        run: python check-deploy.py
+
+  # ----------------------------------------------------------
+  #  4) 打 tag 时发 Release（产物挂成附件，谁都能直接下）
+  # ----------------------------------------------------------
+  release:
+    name: 发 Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [apk, exe]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: 把两个 job 的产物收下来
+        uses: actions/download-artifact@v4
+        with:
+          pattern: signage-*
+          merge-multiple: true
+          path: dist
+
+      - name: 建 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -lh dist
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "门店屏 $GITHUB_REF_NAME" \
+            --notes '自动构建产物：
+
+          - signage-*.apk —— 安卓电视端，拷进电视安装（minSdk 21，老电视也能装）
+          - signage-admin.exe —— 网页后台（Windows），双击运行，第一次要放行防火墙
+          - signage-server.example.json —— 后台启动配置模板，改名成 signage-server.json 放在 exe 旁边就生效
+
+          编译环境：JDK 17 + Android SDK 34 + Gradle 8.7；Python 3.12 + PyInstaller。'
