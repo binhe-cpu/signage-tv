@@ -240,15 +240,27 @@ http://<NAS的IP>:8600/playlist.json
 另一条路更省事：**用已经打好的最小镜像**，NAS 上只有一个 compose 文件，
 代码和 boto3 全在镜像里，连网都不用通。
 
-镜像从哪来，二选一：
+镜像从哪来，三选一：
 
-- **推荐**：GitHub 仓库的 `Releases` 页下载 `signage-admin-docker-<版本>.tar.gz`
-  （就是 `docker save` 出来的），传到 NAS → Container Manager → **映像 → 新增 → 从文件添加**
+- **推荐**：直接在 NAS 上拉（先在「终端机」里执行）
+  ```bash
+  docker pull ghcr.io/binhe-cpu/signage-tv:1.2.0
+  ```
+  包第一次发布**默认是 private**，拉不动就先登录一次：
+  `docker login ghcr.io -u <你的GitHub用户名>`，密码填一个有 `read:packages`
+  权限的 PAT（**不是**GitHub 登录密码）。嫌每次登录麻烦，就去包设置里把它改成
+  public（Package settings → Danger Zone → Change visibility），之后匿名能拉。
+  > 拉不动还有个可能：**国内网络到 ghcr.io 不稳**。那就走下面第二条，别耗在这儿。
+- **拉不通 ghcr.io 就下文件**：`Releases` 页下载
+  `signage-admin-docker-<版本>.tar.gz`（就是 `docker save` 出来的），
+  传到 NAS → Container Manager → **映像 → 新增 → 从文件添加**。这条路 NAS 完全不用联外网
 - 自己在有 Docker 的机器上构建（**在工程根目录**执行，上下文必须是根目录）：
   ```bash
-  docker build -f server/Dockerfile.min -t signage-admin:min-1.2.0 .
-  docker save signage-admin:min-1.2.0 | gzip > signage-admin-docker-1.2.0.tar.gz
+  docker build -f server/Dockerfile.min -t ghcr.io/binhe-cpu/signage-tv:1.2.0 .
+  docker save ghcr.io/binhe-cpu/signage-tv:1.2.0 | gzip > signage-admin-docker-1.2.0.tar.gz
   ```
+  > tag 要打成上面这个 ghcr 名 —— 导入 NAS 之后镜像名才跟 compose 里 `image:`
+  > 对得上。打成别的名字（比如 `signage-admin:min-1.2.0`）容器会起不来。
 
 然后在 NAS 上建一个文件夹，放**一个文件**加两个空目录：
 
@@ -270,9 +282,9 @@ Container Manager → 项目 → 新增 → 路径选这个文件夹 → 来源�
 
 | | 挂代码（零构建） | 最小镜像 |
 |---|---|---|
-| 镜像 | 官方 `python:3.12-slim`，NAS 自己拉 | `signage-admin:min-<版本>`，导进去 |
+| 镜像 | 官方 `python:3.12-slim`，NAS 自己拉 | `ghcr.io/.../signage-tv:<版本>`，直接拉 |
 | NAS 上要不要放代码 | 要拷 `server/` 和 `tools/` | 不用，一个 yml 就够 |
-| NAS 要不要能联网 | 要（拉镜像） | 不要 |
+| NAS 要不要能联网 | 要（拉镜像） | 拉 ghcr 要；走 tar.gz 导入那条路不要 |
 | 改代码怎么生效 | 改完重启容器就行 | 得重新构建、重新导镜像 |
 | 镜像体积 | 约 155MB（装完 boto3） | 约 70MB（Alpine） |
 | 支持 COS 对象存储 | 要现场 build 一次 | 直接填环境变量 |

@@ -107,7 +107,9 @@ services:
 #
 # ── 另一条路：用预构建的最小镜像 ─────────────────────────
 # 上面这套要往 NAS 放代码、NAS 还得能拉官方镜像。想省掉这两件事，
-# 用 CI 打好的最小镜像（Alpine，约 70MB，自带 boto3）：另见 docker-compose.min.yml。
+# 用 CI 打好的最小镜像（Alpine，约 70MB，自带 boto3）：
+#     docker pull ghcr.io/binhe-cpu/signage-tv:latest
+# 部署文件另见 docker-compose.min.yml。
 # 关键区别是那个文件**不挂 ./app**，代码在镜像里。
 # 构建慢的话给 Dockerfile 传个 pip 源：
 #     build:

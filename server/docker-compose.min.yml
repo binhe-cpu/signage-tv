@@ -5,38 +5,52 @@
 #     （挂了反而会用宿主目录把镜像里的代码盖住，目录不存在还会起不来）
 #   · 这个镜像装了 boto3，要用 COS 对象存储直接填环境变量就行，不用改镜像
 #
-# 适合的场合：NAS 上不想放代码、不想能 build、甚至不想联网拉镜像。
+# 适合的场合：NAS 上不想放代码、不想能 build。镜像默认从 ghcr.io 拉，
+# 拉不通就下 tar.gz 从文件导入（那条路 NAS 完全不用联外网）。
 #
 # ── 怎么用 ──────────────────────────────────────────────
-# 1. 先把镜像弄进 NAS，三选一：
-#    a) **推荐**：GitHub 的 Release 里下载 signage-admin-docker-1.2.0.tar.gz，
+# 1. 先把镜像弄进 NAS，四选一：
+#    a) **推荐**：直接拉。NAS 上执行
+#          docker pull ghcr.io/binhe-cpu/signage-tv:1.2.0
+#       这个包第一次发布默认是 private —— 拉不动就先登录一次：
+#          docker login ghcr.io -u <你的GitHub用户名>
+#       密码填一个有 read:packages 权限的 PAT（**不是**GitHub 登录密码）。
+#       嫌每次登录麻烦，就去 GitHub 的包设置里把它改成 public，之后匿名能拉
+#       （Package settings → Danger Zone → Change visibility）。
+#    b) 拉不通 ghcr.io（国内网络常见），就下文件导入：
+#       Release 里下 signage-admin-docker-1.2.0.tar.gz，
 #       传到 NAS → Container Manager → 映像 → 新增 → 从文件添加
-#    b) 自己有 Docker 的机器上构建再导出：
+#    c) 自己有 Docker 的机器上构建再导出：
 #          cd <工程根目录>
-#          docker build -f server/Dockerfile.min -t signage-admin:min-1.2.0 .
-#          docker save signage-admin:min-1.2.0 | gzip > signage-admin-docker-1.2.0.tar.gz
-#    c) 用原版那条路（docker-compose.yml + 挂代码），不需要这个文件
+#          docker build -f server/Dockerfile.min -t ghcr.io/binhe-cpu/signage-tv:1.2.0 .
+#          docker save ghcr.io/binhe-cpu/signage-tv:1.2.0 | gzip > signage-admin-docker-1.2.0.tar.gz
+#       注意 tag 要打成上面这个 ghcr 名 —— 导入 NAS 之后镜像名才跟下面的
+#       image: 对得上。打成别的名字（比如 signage-admin:min-1.2.0）会起不来。
+#    d) 用原版那条路（docker-compose.yml + 挂代码），不需要这个文件
 # 2. 在 NAS 上建项目文件夹（docker 共享文件夹下，比如 signage/），
 #    只放**这一个文件**，再建两个空目录：
 #        signage/
 #          docker-compose.min.yml   ← 这个文件
 #          data/                    ← 空目录就行，访问码和台账会写这里
 #          site/                    ← 空目录就行，发布的清单和素材放这里
-# 3. 改下面标了 ★ 的两行（NAS 的局域网 IP、镜像名里的版本号）
+# 3. 改下面标了 ★ 的两行（NAS 的局域网 IP、镜像版本号）
 # 4. Container Manager → 项目 → 新增 → 路径选这个文件夹 →
 #    来源选「上传 docker-compose.min.yml」→ 启动
 #
 # 页面地址：http://<NAS的IP>:8600/
 # 第一次启动的访问码在容器日志里（Container Manager 里点容器 → 日志）
 #
-# 升级：导入新版本的 tar.gz（名字里带新版本号），把下面 image: 的版本号改掉，
-#       项目「操作 → 重新构建」。data/ 和 site/ 不用动。
+# 升级：把下面 image: 的版本号改成新的（或者干脆写 :latest，永远跟最新构建走），
+#       然后项目「操作 → 重新构建」。走 tar.gz 那条路的话，先导入新版本的 tar.gz。
+#       data/ 和 site/ 不用动。
 
 services:
   signage-admin:
-    # ★ 导入 tar.gz 之后，去「映像」页面看一眼准确的名字再填这里 —— 对不上起不来。
-    #   名字里的 1.2.0 跟镜像本身是一致的，升级时两处一起改。
-    image: signage-admin:min-1.2.0
+    # ★ 升级时改这一行的版本号。三个 tag 的区别：
+    #     · 1.2.0          跟 main 最新构建走，同名 tag 每次 push 会覆盖
+    #     · latest         同上，永远是最新的
+    #     · sha-abcdef0    这一版钉死在某次提交上，**不会**被覆盖 —— 想冻结就用它
+    image: ghcr.io/binhe-cpu/signage-tv:1.2.0
     container_name: signage-admin
 
     # NAS 重启、容器崩了都自己拉起来。除非在界面上手动停，否则一直跑

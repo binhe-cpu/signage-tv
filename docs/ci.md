@@ -1,8 +1,10 @@
 # 在 GitHub 上自动编译
 
-不用本机环境也能出三个产物：**安卓 APK**、**网页后台 exe**、**最小容器镜像**
-（镜像还附带导出成 tar.gz，群晖「映像 → 从文件添加」直接用）。工作流在
-[`.github/workflows/build.yml`](../.github/workflows/build.yml)。
+不用本机环境也能出三个产物：**安卓 APK**、**网页后台 exe**、**最小容器镜像**。
+
+容器镜像会推到 GitHub Packages（`ghcr.io`），NAS 上 `docker pull` 直接能用；
+同时也导出成 tar.gz，留给拉不通 ghcr.io 的场合走「映像 → 从文件添加」。
+工作流在 [`.github/workflows/build.yml`](../.github/workflows/build.yml)。
 
 **公开仓库用这个不花钱** —— GitHub 对公开仓库的 Actions 不计量额度。
 
@@ -12,8 +14,8 @@
 
 | 情况 | 跑什么 |
 |---|---|
-| push 到 `main` | 编译 APK + exe、打最小容器镜像，跑服务端自测（不发 Release） |
-| 提 Pull Request | 同上 |
+| push 到 `main` | 编译 APK + exe、打最小容器镜像**并推到 ghcr.io**，跑服务端自测（不发 Release） |
+| 提 Pull Request | 同上，但**不推 ghcr** —— 外面 fork 过来的 PR 拿不到包写权限，推了必红 |
 | push 一个 `v` 开头的 tag | 上面全跑，**并且自动建 Release**，产物挂成附件 |
 | 在 Actions 页面点 `Run workflow` | 同 push（手动触发） |
 
@@ -29,7 +31,20 @@
 **下产物**（普通 push）：那次运行页面最下方 `Artifacts` 区，下载
 `signage-apk-0.3.8-11`、`signage-admin-exe` 或 `signage-admin-docker-1.2.0`
 （容器镜像那个 zip 里是 `signage-admin-docker-1.2.0.tar.gz` + `docker-compose.min.yml`）。
-那次运行的页面上还有一块 **Summary**，写着两个镜像的体积对比。
+那次运行的页面上还有一块 **Summary**，写着两个镜像的体积对比，以及 ghcr 上的拉取命令。
+
+**容器镜像其实不用下**：push 到 main 之后它已经在包仓库里了，NAS 上直接
+
+```bash
+docker pull ghcr.io/binhe-cpu/signage-tv:latest
+```
+
+包第一次发布**默认是 private**：要匿名拉就去包设置里改成 public
+（Package settings → Danger Zone → Change visibility）。不改也行，拉之前
+`docker login ghcr.io` 填一个有 `read:packages` 权限的 PAT。
+
+三个 tag 的区别：`latest` 和版本号（`1.2.0`）都跟着 main 走、每次 push 会覆盖；
+`sha-xxxxxxx` 钉死在某一次提交上，**不会被覆盖**，想冻结某一版就用它。
 
 > 注意：**Artifacts 要登录 GitHub 才能下**，而且下来是个 zip。
 > 要一个能直接甩链接的下载地址，就得走 Release（下一节）。
@@ -56,7 +71,9 @@ git push origin v0.3.9
 - `signage-0.3.9-12-debug.apk` —— 拷进电视装
 - `signage-admin.exe` —— 网页后台，双击跑
 - `signage-server.example.json` —— 后台的配置模板
-- `signage-admin-docker-1.2.0.tar.gz` —— 最小容器镜像，群晖「映像 → 从文件添加」
+- `signage-admin-docker-1.2.0.tar.gz` —— 最小容器镜像。**平时不用下它**，
+  `docker pull ghcr.io/binhe-cpu/signage-tv:latest` 就行；这个是留给拉不通
+  ghcr.io 的场合的，导进群晖「映像 → 从文件添加」
 - `docker-compose.min.yml` —— 上面那个镜像的群晖部署文件（**不挂代码目录**）
 
 > 注意 exe 旁边那个数字是镜像/服务端的版本号（`server/signage_admin.py` 里的
@@ -108,8 +125,8 @@ Secret 粘贴刚才那一长串 → `Add secret`。
 |---|---|---|
 | 安卓 APK | ubuntu | JDK 17 + Android SDK 34 → `./gradlew :app:assembleDebug`，顺带跑 lint（不拦构建） |
 | 网页后台 exe | windows | PyInstaller 打包 + **真启动 exe 跑 19 项冒烟** |
-| 服务端自测 | ubuntu | `selftest.py`（182 项）+ `check-deploy.py`（73 项，没装 pyyaml 时 46 项） |
-| 容器镜像 | ubuntu | 真 `docker build` 最小镜像（Alpine）+ **真起容器跑 7 项冒烟** + 体积对比 + 导出 tar.gz |
+| 服务端自测 | ubuntu | `selftest.py`（182 项）+ `check-deploy.py`（77 项，没装 pyyaml 时 49 项） |
+| 容器镜像 | ubuntu | 真 `docker build` 最小镜像（Alpine）+ **真起容器跑 7 项冒烟** + 体积对比 + **推 ghcr.io** + 导出 tar.gz |
 | 发 Release | ubuntu | 只在 tag 时跑，收齐产物挂到 Release |
 
 **容器镜像那个 job 为什么也要真起容器**：`check-deploy.py` 只是照着 `COPY` 清单
@@ -153,6 +170,16 @@ exe 当时的输出，通常直接能看出原因。想在本地复现就跑
 的输出，而且会打成 `::error::` 注解（不用登录也能在外面看到）。最常见的两条：
 `页面能打开` 挂了 = `web/` 没进镜像；`import boto3` 挂了 = 多阶段拷贝那段出问题。
 
+**红在「推到 GitHub Packages」**：这一步在冒烟全过之后才跑，所以红了说明镜像本身
+没问题、只是推不上去。两个原因占绝大多数，都写在日志里了：
+
+1. 仓库 `Settings → Actions → General → Workflow permissions` 没选
+   **Read and write**（默认是只读，此时 `GITHUB_TOKEN` 没资格推包）
+2. 这个命名空间下以前推过同名包、但没关联到仓库 —— 这时 `GITHUB_TOKEN` 也会被拒。
+   解法是去包设置里把包**关联到这个仓库**（Connect repository），或者改成用 PAT 推
+
+> 顺带说：PR 上这一步是**跳过**的（fork 来的 PR 拿不到包写权限），所以 PR 绿不代表推到过 ghcr。
+
 **一直排队不跑**：公开仓库的 macOS job 每 5 分钟、单次运行最长 6 小时会有限制，
 我们这个用不到 macOS。排队通常是公共高峰，等一会儿。
 
@@ -163,8 +190,9 @@ exe 当时的输出，通常直接能看出原因。想在本地复现就跑
 - **电视上的界面**。触摸、二维码浮层的显隐这些只能在真机上点。
   CI 能证的是「编译得过、逻辑测试全绿」，证不了「电视上看着对」。
 - **10 块屏的实际同步效果**。那是网络和现场的事。
-- **群晖上真装一遍**。CI 现在能验到「镜像真构建得出来、容器里真跑得起来」这一层，
-  但 DSM 的 Container Manager 怎么解析那个 yml、映像导入有没有问题，还是得在 NAS 上试。
+- **群晖上真装一遍**。CI 现在能验到「镜像真构建得出来、容器里真跑得起来、包真推得上
+  ghcr.io」这一层，但 DSM 的 Container Manager 怎么解析那个 yml、从 ghcr 拉镜像有没有
+  网络问题（国内访问 ghcr.io 不稳），还是得在 NAS 上试。
 - **exe 在别人电脑上跑**。CI 只在那台 runner 上验。
 
 ---

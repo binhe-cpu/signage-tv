@@ -55,6 +55,11 @@ DOCKERFILE = HERE / "Dockerfile"          # 群晖上现场构建那份（slim +
 DOCKERFILE_MIN = HERE / "Dockerfile.min"  # 最小镜像那份（alpine + boto3），CI 打它
 ADMIN_PY = HERE / "signage_admin.py"
 
+# CI 推镜像用的地址：ghcr.io/<用户名>/<仓库名>。仓库改名的话，这里和
+# docker-compose.min.yml 的 image: 两处一起改（build.yml 里是用
+# ${GITHUB_REPOSITORY} 算出来的，不用动）
+GHCR_REPO = "ghcr.io/binhe-cpu/signage-tv"
+
 
 def say(msg=""):
     print(msg, flush=True)
@@ -142,6 +147,11 @@ def check_one_dockerfile(c, path: Path, base: str, label: str) -> list:
     c.ok(f"{label} 声明了 /data 和 /site 两个卷",
          'VOLUME ["/data", "/site"]' in df)
     c.ok(f"{label} 暴露 8600", "EXPOSE 8600" in df)
+    # 这条 label 是把镜像包关联到仓库用的。少了它，第一次推 ghcr 可能被拒
+    # （GITHUB_TOKEN 对「同命名空间下没关联仓库的包」没有写权限），
+    # 而且包页面上看不到源码地址。它在 Dockerfile 里不显眼，容易被顺手删掉。
+    c.ok(f"{label} 有 org.opencontainers.image.source（推 ghcr 靠它关联仓库）",
+         "org.opencontainers.image.source" in df)
     c.ok(f"{label} 的启动命令指向 /app/server/signage_admin.py",
          "/app/server/signage_admin.py" in df)
 
@@ -240,9 +250,13 @@ def check_compose_min(c) -> None:
         return
     text = COMPOSE_MIN.read_text(encoding="utf-8")
     ver = read_admin_version()
-    c.ok("最小版 compose 里写的是最小镜像名，且版本号跟服务端一致",
-         bool(ver) and f"signage-admin:min-{ver}" in text,
-         f"服务端版本 {ver!r}")
+    c.ok("最小版 compose 拉的是 ghcr 上的镜像，tag 跟服务端版本一致",
+         bool(ver) and f"{GHCR_REPO}:{ver}" in text,
+         f"服务端版本 {ver!r} / 期望 {GHCR_REPO}:{ver}")
+    # 老写法（本地打 tag 再导进去）已经换成 ghcr 了，留着说明有人只改了一半。
+    # 只查 image: 那一行 —— 注释里的本地构建命令提到这个名字是正常的
+    c.ok("最小版 compose 的 image: 里没有残留的本地镜像名 signage-admin:min-",
+         "image: signage-admin:min-" not in text)
 
     try:
         import yaml
@@ -261,8 +275,8 @@ def check_compose_min(c) -> None:
          f"实际有 {list(data.get('services') or {})}")
     c.ok("最小版没有过时的 version 字段", "version" not in data)
     img = str(s.get("image") or "")
-    c.ok("最小版 image 指向最小镜像（signage-admin:min-<版本>）",
-         bool(ver) and img == f"signage-admin:min-{ver}", img or "(空)")
+    c.ok("最小版 image 指向 ghcr 上的镜像，tag 就是服务端版本号",
+         bool(ver) and img == f"{GHCR_REPO}:{ver}", img or "(空)")
 
     vols = [str(v) for v in (s.get("volumes") or [])]
     c.ok("最小版**没有**挂 ./app（代码在镜像里，挂了会盖住它，目录不存在还起不来）",

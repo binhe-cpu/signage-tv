@@ -4,7 +4,8 @@
 #    · 安卓 APK     —— ubuntu + JDK 17 + Android SDK 34
 #    · 网页后台 exe —— windows + PyInstaller 单文件
 #    · 最小容器镜像 —— ubuntu + docker build（Alpine 多阶段，约 70MB），
-#                     附带导出成 tar.gz，群晖「映像 → 从文件添加」直接用
+#                     推到 GitHub Packages（ghcr.io），NAS 上 docker pull 就能用；
+#                     同时也导出成 tar.gz，供拉不通 ghcr.io 的场合走「从文件添加」
 #
 #  另外顺手跑服务端自测。这一条有个额外价值：runner 是 Linux，
 #  跟群晖 NAS 是同一个环境，所以「能不能在 Linux 上跑」不用等到
@@ -37,7 +38,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# 默认只读。要写仓库的只有最后那个发 Release 的 job，它自己声明提权
+# 默认只读。需要提权的两个 job 各自声明：
+#   · 推容器镜像 -> packages: write
+#   · 发 Release  -> contents: write
+# 注意 job 级的 permissions 会**整个覆盖**这里，所以那边得把 contents 也写上。
 permissions:
   contents: read
 
@@ -235,11 +239,23 @@ jobs:
   #     这是**唯一真 build 镜像、真起容器**的地方。check-deploy.py 是按 COPY
   #     清单在临时目录里模拟布局，证明不了这三件事：Alpine 上 boto3 装得动、
   #     多阶段拷贝没拷错位置、容器里页面真能打开。这三样都得真跑一次才算数。
+  #
+  #     冒烟过了才往 ghcr.io 推（先验后发，坏镜像推上去不如不推）。推三个 tag：
+  #         latest ／ <服务端版本> ／ sha-<短SHA>
+  #     只有 sha- 那个**不可变**，想钉死某一版就用它；latest 和版本号都跟着
+  #     main 走，每次 push 覆盖同名 tag（所以 compose 里写 :版本号 会跟着升）。
+  #     PR 上只构建不推送 —— fork 过来的 PR 拿不到包写权限，推了必红。
   # ----------------------------------------------------------
   docker:
     name: 容器镜像（最小）
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
+    # 顶层是只读，这里要推包得显式提权。job 级的 permissions 是**覆盖**不是合并，
+    # 所以 contents 必须重写一遍
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - name: 取代码
@@ -362,12 +378,73 @@ jobs:
             echo "| \`signage-admin:slim\` | python:3.12-slim | $SLIM_MB |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # 先起容器验过再推 —— 推上去就是对外发布状态，坏镜像推上去比不推更麻烦
+      - name: 推到 GitHub Packages（ghcr.io）
+        if: github.event_name != 'pull_request'
+        env:
+          V: ${{ steps.ver.outputs.name }}
+          TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # ghcr 的镜像名必须全小写，仓库名万一有大写字母在这儿拉平
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          SHORT=$(printf '%s' "$GITHUB_SHA" | cut -c1-7)
+          LOCAL="signage-admin:min-$V"
+
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+          for T in latest "$V" "sha-$SHORT"; do
+            docker tag "$LOCAL" "$REPO:$T"
+            if ! docker push "$REPO:$T" > "push-$T.log" 2>&1; then
+              echo "———— 推 $REPO:$T 失败 ————"
+              KEY=$(grep -nE "denied|unauthorized|forbidden|Error|error" "push-$T.log" | head -6 || true)
+              echo "$KEY"
+              printf '%s\n' "$KEY" | grep -v '^$' | sed 's/%/%25/g; s/\r$//' \
+                | while IFS= read -r l; do echo "::error title=docker push::${l}"; done
+              tail -20 "push-$T.log"
+              echo ""
+              echo "多半是这两件事之一："
+              echo "  1) 仓库 Settings → Actions → General → Workflow permissions 没选 Read and write"
+              echo "  2) 这个命名空间下以前推过同名包、但没关联到仓库，于是 GITHUB_TOKEN 没权限"
+              exit 1
+            fi
+            echo "已推 $REPO:$T"
+          done
+
+          {
+            echo ""
+            echo "### 容器镜像已发布到 GitHub Packages"
+            echo ""
+            echo '```'
+            echo "docker pull $REPO:$V"
+            echo "docker pull $REPO:latest"
+            echo "docker pull $REPO:sha-$SHORT   # 这一版钉死在这次提交上"
+            echo '```'
+            echo ""
+            echo "包名 \`${GITHUB_REPOSITORY#*/}\`，在仓库右侧的 Packages 区能看到。"
+            echo "**第一次推上去默认是 private**：要匿名 pull 就去包设置里改成 public"
+            echo "（Package settings → Danger Zone → Change visibility）；"
+            echo "保持 private 也行，拉之前在 NAS 上 \`docker login ghcr.io\` 填一个有"
+            echo "\`read:packages\` 的 PAT。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: 导出镜像（群晖「映像 → 新增 → 从文件添加」直接用）
         env:
           V: ${{ steps.ver.outputs.name }}
         run: |
           set -euo pipefail
-          docker save "signage-admin:min-$V" | gzip -9 > "signage-admin-docker-$V.tar.gz"
+          # save 进去的 tag 必须跟 docker-compose.min.yml 里 image: 写的一致，
+          # 不然从 tar.gz 导进 NAS 之后镜像名对不上，容器起不来。
+          # PR 上没推 ghcr（那步跳过了），tag 不存在，就用本地构建名兜底。
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          TAGS=("signage-admin:min-$V")
+          if docker image inspect "$REPO:$V" > /dev/null 2>&1; then
+            TAGS+=("$REPO:$V")
+            echo "包里带上 ghcr 名：$REPO:$V"
+          else
+            echo "（这次没推 ghcr，包里只有本地名 signage-admin:min-$V）"
+          fi
+          docker save "${TAGS[@]}" | gzip -9 > "signage-admin-docker-$V.tar.gz"
           ls -lh "signage-admin-docker-$V.tar.gz"
           TAR=$(du -h "signage-admin-docker-$V.tar.gz" | cut -f1)
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -418,8 +495,11 @@ jobs:
           - signage-*.apk —— 安卓电视端，拷进电视安装（minSdk 21，老电视也能装）
           - signage-admin.exe —— 网页后台（Windows），双击运行，第一次要放行防火墙
           - signage-server.example.json —— 后台启动配置模板，改名成 signage-server.json 放在 exe 旁边就生效
-          - signage-admin-docker-*.tar.gz —— 最小容器镜像（Alpine，约 70MB）。传到群晖
-            「Container Manager → 映像 → 新增 → 从文件添加」，再配 docker-compose.min.yml
+          - 容器镜像也可以直接拉（不用下 tar.gz，NAS 上执行）：
+              docker pull ghcr.io/binhe-cpu/signage-tv:latest
+          - signage-admin-docker-*.tar.gz —— 最小容器镜像（Alpine，约 70MB）。留给
+            拉不通 ghcr.io 的场合：传到群晖「Container Manager → 映像 → 新增 → 从文件添加」，
+            再配 docker-compose.min.yml
           - docker-compose.min.yml —— 上面那个镜像的群晖部署文件。**注意它不挂代码目录**，
             代码在镜像里，只需要建 data/ 和 site/ 两个空目录
 

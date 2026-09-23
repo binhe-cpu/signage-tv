@@ -56,7 +56,8 @@ sh build.sh
 ### 不想用本机环境？让 GitHub 编
 
 代码推上去之后，GitHub 会自动编出三样：**APK**、**网页后台 exe**、
-**最小容器镜像**（Alpine，约 70MB，附带群晖能直接导入的 tar.gz），
+**最小容器镜像**（Alpine，约 70MB，推到 GitHub Packages 可以直接 `docker pull`，
+也附带群晖能导入的 tar.gz），
 不需要本机装 JDK 和 Android SDK。打一个 `v` 开头的 tag 推上去，
 还会自动生成 Release，产物谁都能直接下载：
 
@@ -503,8 +504,9 @@ Windows 也可以双击 `server\start-server.bat`。然后打开 <http://127.0.0
 比"另租服务器"或"店里电脑一直开着"都稳。
 
 想连代码都不往 NAS 上放，就用 CI 打好的**最小镜像**（约 70MB，Alpine）：
-Releases 里下载 `signage-admin-docker-<版本>.tar.gz` 导进 NAS，配一个
-`docker-compose.min.yml` 就完事 —— 走这条 NAS 连网都不用通。
+NAS 上 `docker pull ghcr.io/binhe-cpu/signage-tv:latest` 直接拉，配一个
+`docker-compose.min.yml` 就完事。拉不通 ghcr.io（国内网络常见）就去 Releases
+下 `signage-admin-docker-<版本>.tar.gz` 导进去 —— 走那条 NAS 连网都不用通。
 两种跑法的取舍见 [`server/README.md`](server/README.md) 第三节。
 
 > 注意 `signage-admin.exe` 在群晖上没用（那是 Windows 程序），但**源码一行都不用改**。

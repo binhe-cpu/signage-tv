@@ -20,6 +20,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 
+# 这个 label 是给 GitHub 看的：把镜像和仓库关联起来，Actions 里用 GITHUB_TOKEN
+# 才能往 ghcr.io 推（不关联的话第一次推会被拒），包页面上也能直接点回源码
+LABEL org.opencontainers.image.source="https://github.com/binhe-cpu/signage-tv" \
+      org.opencontainers.image.description="门店屏网页后台 · 容器镜像（slim）"
+
 # PYTHONDONTWRITEBYTECODE：代码目录是只读挂载，别去写 __pycache__
 # PYTHONUNBUFFERED：日志即时输出，不然 docker logs 是空的
 ENV TZ=Asia/Shanghai \

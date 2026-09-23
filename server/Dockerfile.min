@@ -39,6 +39,11 @@ FROM python:3.12-alpine
 # 纯粹是为了日志里那行时间戳顺眼。没这个文件 TZ 环境变量就是空的。
 RUN apk add --no-cache tzdata
 
+# 这个 label 是给 GitHub 看的：把镜像和仓库关联起来，Actions 里用 GITHUB_TOKEN
+# 才能往 ghcr.io 推（不关联的话第一次推会被拒），包页面上也能直接点回源码
+LABEL org.opencontainers.image.source="https://github.com/binhe-cpu/signage-tv" \
+      org.opencontainers.image.description="门店屏网页后台 · 最小容器镜像（Alpine）"
+
 # 顺手删掉跑服务用不上的标准库目录，省几 MB。
 # rm -rf 对不存在的路径不报错，所以这份清单在别的 Python 小版本上少几项也不会失败。
 RUN rm -rf \
