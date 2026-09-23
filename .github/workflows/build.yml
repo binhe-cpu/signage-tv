@@ -245,6 +245,11 @@ jobs:
   #     只有 sha- 那个**不可变**，想钉死某一版就用它；latest 和版本号都跟着
   #     main 走，每次 push 覆盖同名 tag（所以 compose 里写 :版本号 会跟着升）。
   #     PR 上只构建不推送 —— fork 过来的 PR 拿不到包写权限，推了必红。
+  #
+  #     **多架构**：每个 tag 下同时挂 linux/amd64 和 linux/arm64，一个 manifest
+  #     list。x86 的群晖（DS220+、DS920+ 这些）拉 amd64、ARM 的（DS223j、DS124
+  #     这些）拉 arm64，NAS 上不用做任何选择，compose 里也**不要**写 platform。
+  #     代价是 arm64 那条要 qemu 模拟着跑 apk/pip，构建慢一两分钟。
   # ----------------------------------------------------------
   docker:
     name: 容器镜像（最小）
@@ -272,12 +277,30 @@ jobs:
           echo "name=$V" >> "$GITHUB_OUTPUT"
           echo "本次版本：$V"
 
-      - name: 构建最小镜像
+      # 多架构要两样东西：qemu（让 amd64 的 runner 能跑 arm64 的 apk / pip
+      # 这些真二进制）+ buildx（把一个 tag 指向多份不同架构的镜像）。
+      # qemu 必须放在 buildx 前面 —— builder 建好之后才注册的解释器它不认。
+      - name: 装 qemu（跨架构模拟）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 建 buildx builder
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建最小镜像（amd64，先留本地给冒烟用）
         env:
           V: ${{ steps.ver.outputs.name }}
         run: |
           set -o pipefail
-          if ! docker build -f server/Dockerfile.min -t "signage-admin:min-$V" . 2>&1 | tee docker-build.log; then
+          # 这一步只出 amd64：下面冒烟要真起容器，arm64 得靠 qemu 模拟着跑，
+          # 跑得起来也不能代表 ARM 真机没问题，不如交给 NAS 去验。arm64 那条
+          # 在推送那步一起构建，同一个 buildx、缓存复用，不会白跑一遍。
+          if ! docker buildx build \
+                 --platform linux/amd64 \
+                 --load \
+                 --cache-from type=gha,scope=signage-min \
+                 --cache-to type=gha,mode=max,scope=signage-min \
+                 -f server/Dockerfile.min \
+                 -t "signage-admin:min-$V" . 2>&1 | tee docker-build.log; then
             echo "———— 构建失败，关键几行 ————"
             KEY=$(grep -nE "^ERROR|error:|Error|failed|not found" docker-build.log | head -8 || true)
             echo "$KEY"
@@ -300,7 +323,7 @@ jobs:
           NAME=smoke
           PORT=18600
 
-          docker run -d --name "$NAME" -p "$PORT:8600" "$IMG" > /dev/null
+          docker run -d --name "$NAME" --platform linux/amd64 -p "$PORT:8600" "$IMG" > /dev/null
 
           up=""
           for i in $(seq 1 30); do
@@ -362,7 +385,8 @@ jobs:
           set -euo pipefail
           # 原版那份以前只被 check-deploy.py「模拟」验过，这里第一次真 build。
           # 它 build 不过说明群晖现场构建那条路是坏的，所以也算失败，不忽略。
-          docker build -f server/Dockerfile -t signage-admin:slim . > /dev/null
+          docker buildx build --platform linux/amd64 --load \
+            -f server/Dockerfile -t signage-admin:slim . > /dev/null
 
           mb() { docker image inspect "$1" --format '{{.Size}}' | awk '{printf "%.1f MB", $1/1048576}'; }
           MIN_MB=$(mb "signage-admin:min-$V")
@@ -379,7 +403,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       # 先起容器验过再推 —— 推上去就是对外发布状态，坏镜像推上去比不推更麻烦
-      - name: 推到 GitHub Packages（ghcr.io）
+      - name: 构建两个架构并推到 GitHub Packages（ghcr.io）
         if: github.event_name != 'pull_request'
         env:
           V: ${{ steps.ver.outputs.name }}
@@ -389,27 +413,74 @@ jobs:
           # ghcr 的镜像名必须全小写，仓库名万一有大写字母在这儿拉平
           REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
           SHORT=$(printf '%s' "$GITHUB_SHA" | cut -c1-7)
-          LOCAL="signage-admin:min-$V"
 
           echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
-          for T in latest "$V" "sha-$SHORT"; do
-            docker tag "$LOCAL" "$REPO:$T"
-            if ! docker push "$REPO:$T" > "push-$T.log" 2>&1; then
-              echo "———— 推 $REPO:$T 失败 ————"
-              KEY=$(grep -nE "denied|unauthorized|forbidden|Error|error" "push-$T.log" | head -6 || true)
-              echo "$KEY"
-              printf '%s\n' "$KEY" | grep -v '^$' | sed 's/%/%25/g; s/\r$//' \
-                | while IFS= read -r l; do echo "::error title=docker push::${l}"; done
-              tail -20 "push-$T.log"
-              echo ""
-              echo "多半是这两件事之一："
-              echo "  1) 仓库 Settings → Actions → General → Workflow permissions 没选 Read and write"
-              echo "  2) 这个命名空间下以前推过同名包、但没关联到仓库，于是 GITHUB_TOKEN 没权限"
-              exit 1
-            fi
-            echo "已推 $REPO:$T"
-          done
+          # 一次构建两个架构，buildx 自动生成 manifest list：同一个 tag 下挂着
+          # amd64 和 arm64 两份，NAS 拉的时候按自己的 CPU 自动挑，compose 里
+          # **不用**也不该写 platform。
+          #
+          # 为什么不用 `FROM --platform=$BUILDPLATFORM` 那种提速写法（在 runner
+          # 原生机上装 boto3、再拷进 arm64 镜像）：boto3 现在是纯 Python 才碰巧
+          # 能跨架构拷，哪天它的依赖链里进了 C 扩展，就会静默往 arm64 镜像里
+          # 拷一份 amd64 的 .so —— 构建照过，NAS 上 import 才炸。不值得为省
+          # 一两分钟埋这个雷。
+          #
+          # --provenance=false 是必须的：buildx 默认会往里塞 attestation
+          # manifest，manifest list 里会多出两条 unknown/unknown。老版本
+          # Docker（群晖上常见的那些）遇到不认识的平台会直接报
+          # "no matching manifest for linux/amd64" —— 包明明在，就是拉不动，
+          # 报错还完全指不到真正原因。
+          set +e
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --provenance=false \
+            --cache-from type=gha,scope=signage-min \
+            -f server/Dockerfile.min \
+            -t "$REPO:latest" \
+            -t "$REPO:$V" \
+            -t "$REPO:sha-$SHORT" \
+            --push . > push.log 2>&1
+          RC=$?
+          set -e
+          tail -25 push.log
+          if [ "$RC" != "0" ]; then
+            echo "::error title=docker push::多架构构建或推送失败，退出码 $RC"
+            echo "———— 关键几行 ————"
+            KEY=$(grep -nE "denied|unauthorized|forbidden|ERROR|error|no such|no matching" push.log | head -8 || true)
+            echo "$KEY"
+            echo ""
+            echo "多半是这几件事之一："
+            echo "  1) 仓库 Settings → Actions → General → Workflow permissions 没选 Read and write"
+            echo "  2) 这个命名空间下以前推过同名包、但没关联到仓库，于是 GITHUB_TOKEN 没权限"
+            echo "  3) arm64 那条在 qemu 下跑挂了（装 boto3 那步）—— 把 --platform 里的"
+            echo "     arm64 临时去掉能确认是不是这个原因"
+            exit 1
+          fi
+          echo "已推三个 tag，每个都是 amd64 + arm64"
+
+          {
+            echo ""
+            echo "### 容器镜像已发布到 GitHub Packages"
+            echo ""
+            echo "**多架构**：每个 tag 下同时有 \`linux/amd64\` 和 \`linux/arm64\` 两份，"
+            echo "NAS 会按自己的 CPU 自动选，compose 里不用写 platform。"
+            echo ""
+            echo '```'
+            echo "docker pull $REPO:$V"
+            echo "docker pull $REPO:latest"
+            echo "docker pull $REPO:sha-$SHORT   # 这一版钉死在这次提交上"
+            echo '```'
+            echo ""
+            echo "包名 \`${GITHUB_REPOSITORY#*/}\`，在仓库右侧的 Packages 区能看到。"
+            echo "**这个是公开包，匿名就能拉**（GitHub 文档说首次默认 private，但公开仓库"
+            echo "从 workflow 推的包实测是公开的）。万一拉不动，两个可能："
+            echo "  1) 包被设成 private 了 -> Package settings → Danger Zone → Change visibility"
+            echo "  2) 网络到不了 ghcr.io（国内常见）-> 用 Release 里的 tar.gz 导入"
+            echo "真要登录：docker login ghcr.io -u <用户名>，密码填有 read:packages 的 PAT。"
+            echo ""
+            echo "想确认某个 tag 里到底有哪几个架构：\`docker buildx imagetools inspect $REPO:$V\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           {
             echo ""
@@ -429,6 +500,45 @@ jobs:
             echo "真要登录：docker login ghcr.io -u <用户名>，密码填有 read:packages 的 PAT。"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # 推完必须回头看一眼 manifest —— 「推送成功」只说明 HTTP 通了，说明不了
+      # 两个架构真都在里面。少一个架构，得等对应型号的 NAS 去拉才会现，那时候
+      # 包已经对外发布了。attestation 那条同理（它会让老 Docker 拉不动）。
+      - name: 验 manifest 里两个架构都在
+        if: github.event_name != 'pull_request'
+        env:
+          V: ${{ steps.ver.outputs.name }}
+        run: |
+          set -euo pipefail
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker buildx imagetools inspect "$REPO:$V" | tee manifest.txt
+
+          bad=0
+          for A in linux/amd64 linux/arm64; do
+            if grep -q "Platform: *$A" manifest.txt; then
+              echo "  ok   manifest 里有 $A"
+            else
+              echo "  FAIL manifest 里没有 $A"
+              echo "::error title=manifest 缺架构::这次推上去的包里没有 $A 那一份"
+              bad=1
+            fi
+          done
+          if grep -qi "unknown/unknown" manifest.txt; then
+            echo "  FAIL manifest 里有 unknown/unknown（attestation 没关掉，老 Docker 会拉不动）"
+            echo "::error title=manifest 带 attestation::检查 --provenance=false 还在不在"
+            bad=1
+          fi
+          [ "$bad" = "0" ] || exit 1
+
+          {
+            echo ""
+            echo "### 镜像 manifest（一个 tag，两个架构）"
+            echo ""
+            echo '```'
+            grep -E "^(Name|Digest):|Platform:" manifest.txt || cat manifest.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "manifest 验证通过"
+
       - name: 导出镜像（群晖「映像 → 新增 → 从文件添加」直接用）
         env:
           V: ${{ steps.ver.outputs.name }}
@@ -436,20 +546,54 @@ jobs:
           set -euo pipefail
           # save 进去的 tag 必须跟 docker-compose.min.yml 里 image: 写的一致，
           # 不然从 tar.gz 导进 NAS 之后镜像名对不上，容器起不来。
-          # PR 上没推 ghcr（那步跳过了），tag 不存在，就用本地构建名兜底。
+          #
+          # 一个架构出一份文件。为什么不能一次 save 两个：docker save 只认本地
+          # 镜像，而本地同一个 tag 只能存一个架构 —— 后拉的会把先拉的顶掉。
+          # 所以必须「拉一份 → 存一份 → 删掉 tag」轮着来。
           REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
-          TAGS=("signage-admin:min-$V")
-          if docker image inspect "$REPO:$V" > /dev/null 2>&1; then
-            TAGS+=("$REPO:$V")
-            echo "包里带上 ghcr 名：$REPO:$V"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR 上没推 ghcr，只有本地 --load 出来的那份 amd64。产物本来也不上
+            # Release，这里只保证脚本能跑通，别去找一个不存在的包。
+            echo "（PR：没推 ghcr，只导本地这份 amd64，产物本来也不上 Release）"
+            docker tag "signage-admin:min-$V" "$REPO:$V"
+            F="signage-admin-docker-amd64-$V.tar.gz"
+            docker save "$REPO:$V" | gzip -9 > "$F"
+            echo "  amd64 -> $F  $(du -h "$F" | cut -f1)"
           else
-            echo "（这次没推 ghcr，包里只有本地名 signage-admin:min-$V）"
+            for A in amd64 arm64; do
+              if ! docker pull -q --platform "linux/$A" "$REPO:$V" > /dev/null 2>&1; then
+                # 这里**故意不兜底**。上一步刚说推成功了，这会儿却拉不到，
+                # 说明 manifest 或网络有问题 —— 该报警。要是拿本地那份 amd64
+                # 顶上去改个文件名了事，NAS 上导进 ARM 机器才发现架构不对
+                # （exec format error），比直接红难查得多。
+                echo "::error title=导出镜像::ghcr 上拉不到 $A 那一份，而上一步显示推送成功了"
+                echo "———— 直接拉一次看报什么 ————"
+                docker pull --platform "linux/$A" "$REPO:$V" 2>&1 | tail -12 || true
+                echo ""
+                echo "两个可能："
+                echo "  1) manifest 里少了这个架构（去那次运行的 Summary 看有没有 $A）"
+                echo "  2) 网络到 ghcr.io 抽了一下 —— 重跑一次通常就好"
+                exit 1
+              fi
+              F="signage-admin-docker-$A-$V.tar.gz"
+              docker save "$REPO:$V" | gzip -9 > "$F"
+              echo "  $A -> $F  $(du -h "$F" | cut -f1)"
+              # 不删掉，下一轮 pull 另一个架构会因为 tag 已被占用而不更新
+              docker image rm -f "$REPO:$V" > /dev/null 2>&1 || true
+            done
           fi
-          docker save "${TAGS[@]}" | gzip -9 > "signage-admin-docker-$V.tar.gz"
-          ls -lh "signage-admin-docker-$V.tar.gz"
-          TAR=$(du -h "signage-admin-docker-$V.tar.gz" | cut -f1)
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**导出成 tar.gz：$TAR**（随 Artifact / Release 附件一起给）" >> "$GITHUB_STEP_SUMMARY"
+
+          ls -lh signage-admin-docker-*.tar.gz
+          TARS=$(du -ch signage-admin-docker-*.tar.gz | tail -1 | cut -f1)
+          {
+            echo ""
+            echo "**导出成 tar.gz：共 $TARS**（两个架构各一份，NAS 按 CPU 挑）"
+            echo ""
+            echo '```'
+            ls -1 signage-admin-docker-*.tar.gz
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传镜像和部署文件
         uses: actions/upload-artifact@v7
@@ -498,9 +642,11 @@ jobs:
           - signage-server.example.json —— 后台启动配置模板，改名成 signage-server.json 放在 exe 旁边就生效
           - 容器镜像也可以直接拉（不用下 tar.gz，NAS 上执行）：
               docker pull ghcr.io/binhe-cpu/signage-tv:latest
-          - signage-admin-docker-*.tar.gz —— 最小容器镜像（Alpine，约 70MB）。留给
-            拉不通 ghcr.io 的场合：传到群晖「Container Manager → 映像 → 新增 → 从文件添加」，
-            再配 docker-compose.min.yml
+            这个包是**多架构**的，x86 的群晖和 ARM 的群晖用同一个 tag，自动按 CPU 选。
+          - signage-admin-docker-amd64-*.tar.gz / signage-admin-docker-arm64-*.tar.gz
+            —— 最小容器镜像（Alpine，约 70MB），两个架构各一份。留给拉不通 ghcr.io
+            的场合：**先看清你的 NAS 是哪种 CPU**，下对应那份，传到群晖
+            「Container Manager → 映像 → 新增 → 从文件添加」，再配 docker-compose.min.yml
           - docker-compose.min.yml —— 上面那个镜像的群晖部署文件。**注意它不挂代码目录**，
             代码在镜像里，只需要建 data/ 和 site/ 两个空目录
 

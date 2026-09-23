@@ -11,8 +11,22 @@
 # jmespath / dateutil）全是纯 Python，没有要编译的东西，所以 Alpine 上装得动，
 # 不需要引进 gcc / musl-dev 那一堆。
 #
+# **架构**：这份 Dockerfile 不挑平台 —— 同一份脚本，buildx 一次就出 amd64 和
+# arm64 两份，CI 打出来的包挂在同一个 tag 下。x86 的群晖（DS220+ 这些）和 ARM 的
+# 群晖（DS223j、DS124 这些）拉同一个镜像名，各自拿到对的那份，NAS 上不用配。
+# 所以**别在 FROM 上加 --platform=linux/amd64** —— 那样 ARM 的 NAS 只能靠 qemu
+# 模拟着跑，慢，还容易出些说不清的毛病。
+#
 # 构建（在**工程根目录**执行 —— 上下文必须是根目录，因为要 server/ 和 tools/）：
-#     docker build -f server/Dockerfile.min -t signage-admin:min-1.2.0 .
+#     docker build -f server/Dockerfile.min -t ghcr.io/binhe-cpu/signage-tv:1.2.0 .
+#
+# 一次出两个架构（跨架构要 qemu，一次装好一直有效）：
+#     docker run --privileged --rm tonistiigi/binfmt --install all
+#     docker buildx build --platform linux/amd64,linux/arm64 --provenance=false \
+#         -f server/Dockerfile.min -t ghcr.io/binhe-cpu/signage-tv:1.2.0 --push .
+#   `--provenance=false` 别省：默认会附带 attestation manifest，manifest list 里
+#   多出两条 unknown/unknown，老版本 Docker（群晖上常见的那些）看到不认识的平台
+#   会直接报 "no matching manifest for linux/amd64" —— 包明明在，就是拉不动。
 #
 # 国内 pip 慢的话指定个源：
 #     docker build -f server/Dockerfile.min \
@@ -20,8 +34,9 @@
 #         -t signage-admin:min-1.2.0 .
 #
 # 不想自己构建也行：GitHub 的 Release 里有 CI 打好的
-# signage-admin-docker-<版本>.tar.gz（就是 docker save 出来的），
-# 传到群晖「映像 → 新增 → 从文件添加」直接用，NAS 上不需要能联网拉镜像。
+# signage-admin-docker-amd64-<版本>.tar.gz 和 -arm64-<版本>.tar.gz 两份（docker save
+# 出来的）。**按 NAS 的 CPU 挑一份**传到群晖「映像 → 新增 → 从文件添加」直接用，
+# NAS 上不需要能联网拉镜像。
 # 配套的部署文件是 docker-compose.min.yml（注意跟原版有个重要区别：不挂 ./app）。
 
 # ── 第一段：只用来装 boto3 ─────────────────────────────────

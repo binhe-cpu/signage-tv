@@ -250,16 +250,29 @@ http://<NAS的IP>:8600/playlist.json
   > 万一拉不动，按顺序排两个可能：① **国内网络到 ghcr.io 不稳**（最常见）——
   > 直接走下面第二条，别耗在这儿；② 包被设成了 private —— 去 GitHub 包设置里
   > 改回 public（Package settings → Danger Zone → Change visibility）。
-- **拉不通 ghcr.io 就下文件**：`Releases` 页下载
-  `signage-admin-docker-<版本>.tar.gz`（就是 `docker save` 出来的），
-  传到 NAS → Container Manager → **映像 → 新增 → 从文件添加**。这条路 NAS 完全不用联外网
+- **拉不通 ghcr.io 就下文件**：`Releases` 页下载 tar.gz（就是 `docker save` 出来的），
+  传到 NAS → Container Manager → **映像 → 新增 → 从文件添加**。这条路 NAS 完全不用联外网。
+  **先看清 NAS 是哪种 CPU，下对的那一份**：
+  - x86 的群晖（绝大多数型号）→ `signage-admin-docker-amd64-<版本>.tar.gz`
+  - ARM 的群晖（DS223j / DS124 这类）→ `signage-admin-docker-arm64-<版本>.tar.gz`
+
+  NAS 上 `uname -m`：`x86_64` 下 amd64，`aarch64` 下 arm64。下错了导入会报架构不符。
 - 自己在有 Docker 的机器上构建（**在工程根目录**执行，上下文必须是根目录）：
   ```bash
   docker build -f server/Dockerfile.min -t ghcr.io/binhe-cpu/signage-tv:1.2.0 .
-  docker save ghcr.io/binhe-cpu/signage-tv:1.2.0 | gzip > signage-admin-docker-1.2.0.tar.gz
+  docker save ghcr.io/binhe-cpu/signage-tv:1.2.0 | gzip > signage-admin-docker-amd64-1.2.0.tar.gz
   ```
   > tag 要打成上面这个 ghcr 名 —— 导入 NAS 之后镜像名才跟 compose 里 `image:`
   > 对得上。打成别的名字（比如 `signage-admin:min-1.2.0`）容器会起不来。
+  > 本机是什么架构就出什么架构；要给 ARM 的 NAS 也备一份，得用 `buildx`
+  > （命令见 `Dockerfile.min` 顶部）。
+
+**x86 和 ARM 的群晖都支持，用同一个镜像名。** CI 打出来的包是**多架构**的：
+一个 tag 下挂着 `linux/amd64` 和 `linux/arm64` 两份，`docker pull` 的时候按 NAS 的
+CPU 自动挑，`docker-compose.min.yml` 里不用（也不该）写 `platform:`。
+
+> 想确认某个 tag 里到底有哪些架构（不用 Docker，本机装了 buildx 就行）：
+> `docker buildx imagetools inspect ghcr.io/binhe-cpu/signage-tv:1.2.0`
 
 然后在 NAS 上建一个文件夹，放**一个文件**加两个空目录：
 

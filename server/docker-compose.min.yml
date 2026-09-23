@@ -13,21 +13,31 @@
 #    a) **推荐**：直接拉。NAS 上执行
 #          docker pull ghcr.io/binhe-cpu/signage-tv:1.2.0
 #       这个包**是公开的，匿名就能拉，不用登录**（实测过）。
+#       而且**是多架构的**：同一个 tag 下挂着 amd64 和 arm64 两份，x86 的群晖
+#       （DS220+ 这些）和 ARM 的群晖（DS223j 这些）各自拿到对的那份，你不用管。
+#       下面**不要**加 platform: —— 加了反而会强制用错架构、或者让 ARM 机上
+#       顶着 qemu 模拟跑（慢，还容易出怪问题）。
 #       万一拉不动，两个可能，按顺序排查：
 #         · 网络到不了 ghcr.io（国内常见）→ 直接走下面 b) 那条路，别耗在这儿
 #         · 包被设成了 private → GitHub 包设置里改回 public
 #           （Package settings → Danger Zone → Change visibility）
 #       真要登录的话：docker login ghcr.io -u <你的GitHub用户名>，密码填一个有
 #       read:packages 权限的 PAT（**不是**GitHub 登录密码）。
-#    b) 拉不通 ghcr.io（国内网络常见），就下文件导入：
-#       Release 里下 signage-admin-docker-1.2.0.tar.gz，
+#    b) 拉不通 ghcr.io（国内网络常见），就下文件导入。
+#       **先看清 NAS 是哪种 CPU，下对的那一份**（下错了导入会报架构不符）：
+#         · x86 的群晖（绝大多数型号，Intel / AMD 芯片）
+#             → signage-admin-docker-amd64-1.2.0.tar.gz
+#         · ARM 的群晖（DS223j / DS124 这类 ARM 芯片）
+#             → signage-admin-docker-arm64-1.2.0.tar.gz
 #       传到 NAS → Container Manager → 映像 → 新增 → 从文件添加
-#    c) 自己有 Docker 的机器上构建再导出：
+#       不确定是哪种？NAS 上执行 uname -m：x86_64 就下 amd64、aarch64 就下 arm64。
+#    c) 自己有 Docker 的机器上构建再导出（本机是什么架构就出什么架构）：
 #          cd <工程根目录>
 #          docker build -f server/Dockerfile.min -t ghcr.io/binhe-cpu/signage-tv:1.2.0 .
-#          docker save ghcr.io/binhe-cpu/signage-tv:1.2.0 | gzip > signage-admin-docker-1.2.0.tar.gz
+#          docker save ghcr.io/binhe-cpu/signage-tv:1.2.0 | gzip > signage-admin-docker-amd64-1.2.0.tar.gz
 #       注意 tag 要打成上面这个 ghcr 名 —— 导入 NAS 之后镜像名才跟下面的
 #       image: 对得上。打成别的名字（比如 signage-admin:min-1.2.0）会起不来。
+#       要给 ARM 的 NAS 也备一份，得用 buildx（见 Dockerfile.min 顶部那几条命令）。
 #    d) 用原版那条路（docker-compose.yml + 挂代码），不需要这个文件
 # 2. 在 NAS 上建项目文件夹（docker 共享文件夹下，比如 signage/），
 #    只放**这一个文件**，再建两个空目录：

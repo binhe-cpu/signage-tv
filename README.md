@@ -505,8 +505,10 @@ Windows 也可以双击 `server\start-server.bat`。然后打开 <http://127.0.0
 
 想连代码都不往 NAS 上放，就用 CI 打好的**最小镜像**（约 70MB，Alpine）：
 NAS 上 `docker pull ghcr.io/binhe-cpu/signage-tv:latest` 直接拉，配一个
-`docker-compose.min.yml` 就完事。拉不通 ghcr.io（国内网络常见）就去 Releases
-下 `signage-admin-docker-<版本>.tar.gz` 导进去 —— 走那条 NAS 连网都不用通。
+`docker-compose.min.yml` 就完事。这个包**是多架构的**（一个 tag 下挂着 amd64 和
+arm64 两份），x86 的群晖和 ARM 的群晖拉同一个名字，自动挑对的。拉不通 ghcr.io
+（国内网络常见）就去 Releases 下 tar.gz 导进去 —— 那条路 NAS 连网都不用通，
+但**得按 NAS 的 CPU 挑一份**（`-amd64-` 还是 `-arm64-`）。
 两种跑法的取舍见 [`server/README.md`](server/README.md) 第三节。
 
 > 注意 `signage-admin.exe` 在群晖上没用（那是 Windows 程序），但**源码一行都不用改**。

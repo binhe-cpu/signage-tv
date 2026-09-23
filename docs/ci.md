@@ -30,7 +30,8 @@
 
 **下产物**（普通 push）：那次运行页面最下方 `Artifacts` 区，下载
 `signage-apk-0.3.8-11`、`signage-admin-exe` 或 `signage-admin-docker-1.2.0`
-（容器镜像那个 zip 里是 `signage-admin-docker-1.2.0.tar.gz` + `docker-compose.min.yml`）。
+（容器镜像那个 zip 里是 `signage-admin-docker-amd64-1.2.0.tar.gz` +
+`signage-admin-docker-arm64-1.2.0.tar.gz` + `docker-compose.min.yml`）。
 那次运行的页面上还有一块 **Summary**，写着两个镜像的体积对比，以及 ghcr 上的拉取命令。
 
 **容器镜像其实不用下**：push 到 main 之后它已经在包仓库里了，NAS 上直接
@@ -42,6 +43,19 @@ docker pull ghcr.io/binhe-cpu/signage-tv:latest
 包**是公开的，匿名就能拉**，不用登录（实测：不带任何凭据请求 manifest 返回 200）。
 万一拉不动，按顺序排两个可能：① 网络到不了 ghcr.io（国内最常见）；② 包被设成了
 private —— 去 `Package settings → Danger Zone → Change visibility` 改回 public。
+
+**多架构**：每个 tag 下同时挂着 `linux/amd64` 和 `linux/arm64` —— x86 的群晖和
+ARM 的群晖拉同一个名字，各自拿到对的那份。看看里面有哪几个架构：
+
+```bash
+docker buildx imagetools inspect ghcr.io/binhe-cpu/signage-tv:latest
+```
+
+CI 里这步是**验过的**（少一个架构直接红），另外顺手把 manifest 打进了那次运行的
+Summary。有个坑记在这儿：buildx 默认会附带 attestation manifest，manifest list 里
+会多两条 `unknown/unknown`，**老版本 Docker（群晖上常见的那些）会因此报
+`no matching manifest for linux/amd64`** —— 所以 workflow 里带了
+`--provenance=false`，CI 也断言了 manifest 里没有 `unknown/unknown`。别顺手删。
 
 三个 tag 的区别：`latest` 和版本号（`1.2.0`）都跟着 main 走、每次 push 会覆盖；
 `sha-xxxxxxx` 钉死在某一次提交上，**不会被覆盖**，想冻结某一版就用它。
@@ -71,9 +85,11 @@ git push origin v0.3.9
 - `signage-0.3.9-12-debug.apk` —— 拷进电视装
 - `signage-admin.exe` —— 网页后台，双击跑
 - `signage-server.example.json` —— 后台的配置模板
-- `signage-admin-docker-1.2.0.tar.gz` —— 最小容器镜像。**平时不用下它**，
-  `docker pull ghcr.io/binhe-cpu/signage-tv:latest` 就行；这个是留给拉不通
-  ghcr.io 的场合的，导进群晖「映像 → 从文件添加」
+- `signage-admin-docker-amd64-1.2.0.tar.gz` / `signage-admin-docker-arm64-1.2.0.tar.gz`
+  —— 最小容器镜像，两个架构各一份。**平时不用下它**，
+  `docker pull ghcr.io/binhe-cpu/signage-tv:latest` 就行（那个包本身是多架构的，
+  会自动挑）；这两份是留给拉不通 ghcr.io 的场合的，**按 NAS 的 CPU 挑一份**
+  导进群晖「映像 → 从文件添加」
 - `docker-compose.min.yml` —— 上面那个镜像的群晖部署文件（**不挂代码目录**）
 
 > 注意 exe 旁边那个数字是镜像/服务端的版本号（`server/signage_admin.py` 里的

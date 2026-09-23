@@ -60,6 +60,10 @@ ADMIN_PY = HERE / "signage_admin.py"
 # ${GITHUB_REPOSITORY} 算出来的，不用动）
 GHCR_REPO = "ghcr.io/binhe-cpu/signage-tv"
 
+# CI 的 workflow。镜像是在那儿真 build、真起容器的（本机常常没 Docker），
+# 所以「CI 那段脚本写得对不对」也得有人查 —— 放在这儿一起查。
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "build.yml"
+
 
 def say(msg=""):
     print(msg, flush=True)
@@ -155,6 +159,15 @@ def check_one_dockerfile(c, path: Path, base: str, label: str) -> list:
     c.ok(f"{label} 的启动命令指向 /app/server/signage_admin.py",
          "/app/server/signage_admin.py" in df)
 
+    # FROM 上写 --platform=linux/amd64 会把镜像钉死在一个架构上：ARM 的群晖
+    # （DS223j、DS124 这些）要么装不上，要么只能让 qemu 顶着模拟跑 —— 慢，而且
+    # 出问题时报错五花八门。多架构的正确写法是**什么都不写**，让 buildx 按
+    # 目标平台去构建。这条很容易被「本地跑得起来就行」的改法顺手加上。
+    froms = [l.strip() for l in df.splitlines()
+             if l.strip().upper().startswith("FROM ")]
+    c.ok(f"{label} 的 FROM 没有硬编码 --platform（钉死架构会坑 ARM 的 NAS）",
+         bool(froms) and not any("--platform" in l for l in froms), str(froms))
+
     copies = parse_copies(df)
     c.ok(f"{label} 里能解析出 COPY 指令", bool(copies), str(copies))
     for src, _ in copies:
@@ -178,6 +191,10 @@ def check_files(c) -> list:
     # 所以 .dockerignore 放 server/ 里不生效 —— 这个位置很容易搞错。
     c.ok("仓库根目录有 .dockerignore（放 server/ 里不生效，上下文根是仓库根）",
          (ROOT / ".dockerignore").exists())
+
+    # 放在这儿而不是 check_compose_min 后面：上面几个分支有 early return，
+    # 放末尾的话没装 pyyaml 时就整段跳过了
+    check_ci_docker(c)
 
     text = COMPOSE.read_text(encoding="utf-8")
     try:
@@ -250,6 +267,14 @@ def check_compose_min(c) -> None:
         return
     text = COMPOSE_MIN.read_text(encoding="utf-8")
     ver = read_admin_version()
+
+    # 镜像本身是多架构的，compose 里写 platform: 会把它钉死 —— ARM 的 NAS 上要么
+    # 装不上，要么拉 amd64 那份顶着 qemu 跑。所以这一项**必须没有**。
+    # 用带行首缩进的正则而不是 `"platform" in text`：注释里提到这个词是正常的
+    # （上面就有一段「不要加 platform:」的说明）。
+    c.ok("最小版 compose 没写 platform:（写了会把多架构镜像钉死在某个架构上）",
+         not re.search(r"^\s+platform\s*:", text, re.M),
+         "找到 platform: 那一行")
     c.ok("最小版 compose 拉的是 ghcr 上的镜像，tag 跟服务端版本一致",
          bool(ver) and f"{GHCR_REPO}:{ver}" in text,
          f"服务端版本 {ver!r} / 期望 {GHCR_REPO}:{ver}")
@@ -300,6 +325,59 @@ def check_compose_min(c) -> None:
          any(str(p).endswith(":8600") for p in (s.get("ports") or [])),
          str(s.get("ports")))
     c.ok("最小版有健康检查", bool(s.get("healthcheck")))
+
+
+# ------------------------------------------------- 一之二、CI 里的镜像构建
+
+def check_ci_docker(c) -> None:
+    """CI 里那个打镜像的 job。
+
+    本机常常没 Docker（这个脚本的整个设计前提），所以「真 build、真起容器」只有
+    CI 干得了 —— 那段脚本写错了，得等 CI 红一次才知道。多架构这几条尤其阴：
+    漏了 qemu 会在 arm64 那条直接挂（还算看得见），漏了 --provenance=false 则是
+    构建、冒烟、推送全绿，只有 NAS 上拉不动，报错还指不到原因。
+    """
+    if not CI_WORKFLOW.exists():
+        c.ok("CI 工作流存在（.github/workflows/build.yml）", False,
+             str(CI_WORKFLOW))
+        return
+    t = CI_WORKFLOW.read_text(encoding="utf-8")
+
+    c.ok("CI 装了 qemu（arm64 那条要在 amd64 的 runner 上模拟着跑）",
+         "docker/setup-qemu-action" in t)
+    c.ok("CI 建了 buildx（多架构 manifest 靠它，普通 docker build 出不来）",
+         "docker/setup-buildx-action" in t)
+    # qemu 必须排在 buildx 前面：builder 是先起容器再注册解释器的，
+    # 反过来的话 builder 里没有 binfmt，arm64 那条会以
+    # "exec format error" 挂掉，看着像 Dockerfile 写错了。
+    i_qemu = t.find("docker/setup-qemu-action")
+    i_bx = t.find("docker/setup-buildx-action")
+    c.ok("qemu 那步排在 buildx 前面（顺序反了就是 exec format error）",
+         0 <= i_qemu < i_bx, f"qemu 在 {i_qemu}，buildx 在 {i_bx}")
+
+    # 下面这几条一律用「行首缩进的正则」而不是 `"xxx" in t`：
+    # 同一个词在注释和 ::error 的报错文案里也会出现（--provenance=false 在注释
+    # 和报错提示里各有一处、imagetools 在 Summary 那句话里还有一处），用 in 判断
+    # 的话真指令被删掉了断言照样绿 —— 那就成了摆设。
+    # （第一版就是这么写的，拿桩把文件打坏验证时才发现，见下面的注释。）
+    c.ok("CI 一次构建两个架构（--platform linux/amd64,linux/arm64）",
+         bool(re.search(r"^\s+--platform linux/amd64,linux/arm64\s*\\$", t, re.M)))
+    # buildx 默认附带 attestation manifest，manifest list 里会多出两条
+    # unknown/unknown。老版本 Docker（群晖上常见的那些）遇到不认识的平台直接报
+    # "no matching manifest for linux/amd64" —— 包明明在那儿，就是拉不动。
+    c.ok("CI 关了 attestation（--provenance=false，不关老 Docker 拉不动）",
+         bool(re.search(r"^\s+--provenance=false\s*\\$", t, re.M)))
+    c.ok("CI 用 buildx --push 直接推多架构（不是本地 tag 再 docker push）",
+         bool(re.search(r"^\s+--push\s", t, re.M)))
+    c.ok("CI 里真有一行在验 manifest（docker buildx imagetools inspect）",
+         bool(re.search(r"^\s+docker buildx imagetools inspect", t, re.M)))
+    # 两个架构各出一份 tar.gz。不能一次 save 两个：docker save 只认本地镜像，
+    # 本地同一个 tag 只能存一个架构（后拉的把先拉的顶掉）。
+    # 钉住「循环 + 文件名拼架构」这两行。别退化成在整份 workflow 里找字面
+    # "-arm64-"：Release 说明里就有这几个字，那种断言删掉真循环也不会红。
+    c.ok("CI 导出两个架构的 tar.gz（循环遍历 amd64/arm64，文件名拼架构）",
+         "for A in amd64 arm64" in t
+         and "signage-admin-docker-$A-$V.tar.gz" in t)
 
 
 # ---------------------------------------------------------------- 二、搭布局
