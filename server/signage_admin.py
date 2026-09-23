@@ -86,6 +86,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+# Windows 上这个服务被冻成 exe 之后，标准输出用的是「系统 ANSI 代码页」——
+# 中文系统是 cp936（没事），英文系统是 cp1252，一 print 中文就 UnicodeEncodeError
+# 把进程崩掉。启动日志、访问码、电视端地址全在 stdout 上，崩了就是窗口一闪，
+# 连原因都看不见。
+#
+# 注意：**PYTHONIOENCODING 对冻过的 exe 不起作用**（实测过，它只认系统代码页），
+# 而且双击运行时是控制台（走 UTF-8，中文没问题），只有输出被接进管道或文件里
+# 才会炸——CI 上正是这个情形。所以只能自己把自己锁成 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 _HERE = Path(__file__).resolve().parent
 # 打成独立 exe（PyInstaller）之后有「两个目录」，必须分开：
 #   _BUNDLE_DIR —— 只读的打包内容（web/ 页面）。单文件模式下每次启动都解到临时目录
