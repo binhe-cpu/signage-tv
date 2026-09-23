@@ -56,6 +56,18 @@ else:
     DEFAULT_DIST = HERE / "dist-tmp"
 
 
+# Windows 上 Python 往管道/文件写东西时用的是「系统区域编码」——英文系统就是 cp1252，
+# 而这个脚本从头到尾在 print 中文，在那样的机器上第一行就 UnicodeEncodeError 崩掉。
+# （本机因为一直在 UTF-8 的 Git Bash 里跑，带没带 PYTHONIOENCODING 都看不出来；
+#  这类问题只在别人的机器上、或者 CI 上才现形。）
+# 这里直接把自己的标准输出锁成 UTF-8，谁的环境都跑得起来。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
 def say(msg=""):
     print(msg, flush=True)
 

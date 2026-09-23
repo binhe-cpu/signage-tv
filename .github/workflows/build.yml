@@ -15,6 +15,14 @@
 #        挂出去（Release 附件谁都能直接下载，不用登录）：
 #            git tag v0.3.9 && git push origin v0.3.9
 #  手动：Actions 页面选这个工作流 -> Run workflow。
+#
+#  ── 踩过的坑（改这个文件之前先看）─────────────────────────
+#  1. Windows runner 是英文系统，Python 打印中文到管道会 UnicodeEncodeError。
+#     所以下面统一设 PYTHONIOENCODING / PYTHONUTF8，脚本自己也做了保护。
+#  2. 别用 android-actions/setup-android：它是 Node 20 时代的，runner 升到
+#     Node 24 之后跑不起来。runner 上本来就装了 Android SDK，直接用。
+#  3. action 版本要跟着官方 README 走（现在都是最新 major），老版本会被
+#     runner 强制用新 Node 跑，行为不稳。
 # ============================================================
 
 name: 构建
@@ -30,6 +38,11 @@ on:
 # 默认只读。要写仓库的只有最后那个发 Release 的 job，它自己声明提权
 permissions:
   contents: read
+
+# Windows 上不给这个，Python 一 print 中文就崩（见上面坑 #1）
+env:
+  PYTHONIOENCODING: utf-8
+  PYTHONUTF8: "1"
 
 # 同一个分支连着推两次，把前一次没跑完的取消掉，省额度
 concurrency:
@@ -47,23 +60,31 @@ jobs:
 
     steps:
       - name: 取代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 装 JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
 
-      - name: 装 Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: 装 SDK 34（compileSdk 要的就是这个版本）
+      - name: 准备 Android SDK 34
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager --install "platforms;android-34" "build-tools;34.0.0" "platform-tools"
-          sdkmanager --list_installed | head -20
+          # runner 上本来就有 Android SDK，这里只是找到它、把我们要的版本补上。
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$SDK"     >> "$GITHUB_ENV"
+          SDKMGR=$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | tail -1)
+          if [ -z "$SDKMGR" ]; then
+            echo "::error title=找不到 sdkmanager::SDK 目录是 $SDK，里面的东西：$(ls "$SDK" 2>/dev/null | tr '\n' ' ')"
+            exit 1
+          fi
+          echo "用的 sdkmanager：$SDKMGR"
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          "$SDKMGR" --install "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+          echo "———— 现在装了这些 ————"
+          "$SDKMGR" --list_installed | head -15
 
       - name: 读出本次版本号
         id: ver
@@ -71,7 +92,7 @@ jobs:
           V=$(grep -oP '^val appVersionName = "\K[^"]+' app/build.gradle.kts)
           C=$(grep -oP '^val appVersionCode = \K[0-9]+' app/build.gradle.kts)
           if [ -z "$V" ] || [ -z "$C" ]; then
-            echo "！没能从 app/build.gradle.kts 里读出版本号，检查那两行还在不在"
+            echo "::error title=读不出构建版本号::app/build.gradle.kts 开头那两行 appVersionName / appVersionCode 是不是被改坏了"
             exit 1
           fi
           echo "name=$V" >> "$GITHUB_OUTPUT"
@@ -80,7 +101,7 @@ jobs:
 
       # 为什么要这一步：AGP 默认的 debug 签名是「每台机器各自生成一个」。
       # 不固定的话，CI 打的 APK 和你在本机 build.bat 打的 APK 签名不同，
-      # 装在同一个电视上会互相覆盖不了（系统报「应用未安装」，看不出原因）。
+      # 装在同一个电视上会互相覆盖不了（系统只报「应用未安装」，看不出原因）。
       # 把本机那个 debug.keystore 存成仓库 secret，两边就一致了。
       - name: 装上固定签名
         env:
@@ -91,13 +112,23 @@ jobs:
             printf '%s' "$KEYSTORE_B64" | base64 -d > "$HOME/.android/debug.keystore"
             echo "已装入固定的 debug keystore —— 这个 APK 能和本机构建的互相覆盖安装"
           else
-            echo "::notice title=用的是临时签名::没配 DEBUG_KEYSTORE_BASE64。"
-            echo "APK 本身能装能跑，但不能覆盖本机构建的那个（换着装要先卸载）。"
-            echo "想固定签名：见 docs/ci.md。"
+            echo "::notice title=用的是临时签名::没配 DEBUG_KEYSTORE_BASE64，APK 能装能跑，但不能覆盖本机构建的那个（换着装要先卸载）。想固定签名见 docs/ci.md。"
           fi
 
       - name: 编译 debug APK
-        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+        run: |
+          set -o pipefail
+          if ! ./gradlew :app:assembleDebug --no-daemon --stacktrace 2>&1 | tee gradle.log; then
+            echo "———— 编译失败，关键几行 ————"
+            KEY=$(grep -nE "^e: |error:|What went wrong|Execution failed|Could not|FAILURE:" gradle.log | head -8 || true)
+            echo "$KEY"
+            # 打成注解：这是不需要登录 GitHub 也能读到的通道（日志要登录）
+            printf '%s\n' "$KEY" | grep -v '^$' | sed 's/%/%25/g; s/\r$//' \
+              | while IFS= read -r l; do echo "::error title=gradle::${l}"; done
+            echo "———— 最后 20 行 ————"
+            tail -20 gradle.log
+            exit 1
+          fi
 
       - name: 顺便跑 lint（只报告，不拦构建）
         continue-on-error: true
@@ -107,7 +138,7 @@ jobs:
         run: ls -lh app/build/outputs/apk/debug/
 
       - name: 上传 APK
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: signage-apk-${{ steps.ver.outputs.name }}-${{ steps.ver.outputs.code }}
           path: app/build/outputs/apk/debug/*.apk
@@ -124,10 +155,10 @@ jobs:
 
     steps:
       - name: 取代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 装 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -145,11 +176,21 @@ jobs:
       - name: 打包 + 冒烟测试
         shell: bash
         run: |
+          set -o pipefail
           cd server
-          python build-exe.py --work "$RUNNER_TEMP/pi-work" --dist "$RUNNER_TEMP/pi-dist"
+          if ! python build-exe.py --work "$RUNNER_TEMP/pi-work" --dist "$RUNNER_TEMP/pi-dist" 2>&1 | tee build-exe.log; then
+            echo "———— 打包/冒烟失败，关键几行 ————"
+            KEY=$(grep -nE "Traceback|Error|error:|失败|没通过|！|X " build-exe.log | head -8 || true)
+            echo "$KEY"
+            printf '%s\n' "$KEY" | grep -v '^$' | sed 's/%/%25/g; s/\r$//' \
+              | while IFS= read -r l; do echo "::error title=build-exe::${l}"; done
+            echo "———— 最后 25 行 ————"
+            tail -25 build-exe.log
+            exit 1
+          fi
 
       - name: 上传 exe
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: signage-admin-exe
           path: server/dist/
@@ -159,8 +200,8 @@ jobs:
   # ----------------------------------------------------------
   #  3) 服务端自测
   #     价值：runner 是 Linux，跟群晖同一个环境。
-      #     check-deploy.py 会按 Dockerfile 里的 COPY 清单搭一份一模一样的
-      #     目录布局再起真服务 —— 漏拷文件当场暴露，不用等到 NAS 上。
+  #     check-deploy.py 会按 Dockerfile 里的 COPY 清单搭一份一模一样的
+  #     目录布局再起真服务 —— 漏拷文件当场暴露，不用等到 NAS 上。
   # ----------------------------------------------------------
   server-tests:
     name: 服务端自测（Linux）
@@ -169,10 +210,10 @@ jobs:
 
     steps:
       - name: 取代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 装 Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -201,18 +242,20 @@ jobs:
 
     steps:
       - name: 把两个 job 的产物收下来
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
-          pattern: signage-*
-          merge-multiple: true
           path: dist
 
       - name: 建 Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ls -lh dist
-          gh release create "$GITHUB_REF_NAME" dist/* \
+          # 每个 artifact 落在 dist/ 下的一个子目录里，用 find 收拢，
+          # 不依赖 download-artifact 的参数名（那些跨大版本会变）
+          find dist -type f -printf '%s\t%p\n' | sort -rn
+          mapfile -t FILES < <(find dist -type f | sort)
+          echo "共 ${#FILES[@]} 个文件"
+          gh release create "$GITHUB_REF_NAME" "${FILES[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "门店屏 $GITHUB_REF_NAME" \
             --notes '自动构建产物：
